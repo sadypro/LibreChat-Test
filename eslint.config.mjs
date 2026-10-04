@@ -57,6 +57,7 @@ export default [
       'packages/data-provider/test_bundle/**/*',
       'packages/data-schemas/dist/**/*',
       'packages/data-schemas/misc/**/*',
+      'packages/agentcore/dist/**/*',
       'data-node/**/*',
       'meili_data/**/*',
       '**/node_modules/**/*',
