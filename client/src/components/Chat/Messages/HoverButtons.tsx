@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useCallback, memo } from 'react';
 import { Copy, Check } from 'lucide';
+import { useAtomValue } from 'jotai';
 import { useRecoilState } from 'recoil';
 import { findMessageById, isUserInitiatedCompaction } from 'librechat-data-provider';
 import {
@@ -11,9 +12,10 @@ import {
   RegenerateIcon,
 } from '@librechat/client';
 import type { TConversation, TMessage, TFeedback } from 'librechat-data-provider';
+import { useMessagesIsSubmitting, useOptionalMessagesOperations } from '~/Providers';
 import { useGenerationsByLatest, useLocalize } from '~/hooks';
-import { useOptionalMessagesOperations } from '~/Providers';
 import { hasEditablePart } from './Content/editableParts';
+import { revealedQueuedTurnFamily } from '~/store/steer';
 import { Fork } from '~/components/Conversations';
 import { hoverButtonClasses } from './styles';
 import MessageAudio from './MessageAudio';
@@ -27,11 +29,14 @@ type THoverButtons = {
   copyToClipboard: (setIsCopied: React.Dispatch<React.SetStateAction<boolean>>) => void;
   getCanCopy: () => boolean;
   conversation: TConversation | null;
-  isSubmitting: boolean;
   message: TMessage;
   regenerate: () => void;
   handleContinue: (e: React.MouseEvent<HTMLButtonElement>) => void;
+  /** The tail as of the row's last render, which the row re-renders on whenever
+   *  this message enters or leaves it; compared against, never sent anywhere. */
   latestMessageId?: string;
+  /** The tail at call time, for actions that send it (forking at a split target). */
+  getLatestMessageId?: () => string | undefined;
   isLast: boolean;
   index: number;
   handleFeedback?: ({ feedback }: { feedback: TFeedback | undefined }) => void;
@@ -127,18 +132,22 @@ const HoverButtons = ({
   copyToClipboard,
   getCanCopy,
   conversation,
-  isSubmitting,
   message,
   regenerate,
   handleContinue,
   latestMessageId,
+  getLatestMessageId,
   isLast,
   handleFeedback,
 }: THoverButtons) => {
   const localize = useLocalize();
+  /** Subscribed here rather than passed down: a send toggles the rerun controls on
+   *  every row, and only this toolbar has to re-render for it. */
+  const isSubmitting = useMessagesIsSubmitting();
   const [isCopied, setIsCopied] = useState(false);
   const [TextToSpeech] = useRecoilState<boolean>(store.textToSpeech);
   const { getMessages } = useOptionalMessagesOperations();
+  const pendingReveal = useAtomValue(revealedQueuedTurnFamily(conversation?.conversationId ?? ''));
 
   const endpoint = useMemo(() => {
     if (!conversation) {
@@ -152,22 +161,30 @@ const HoverButtons = ({
    *  indexed once for all its rows rather than scanned once per row, and the memo
    *  is keyed on the parent id: `getMessages` is a cache read, not a subscription,
    *  and a parent's authorship never changes. Outside the messages view (a search
-   *  row) the thread is unavailable and the answer stays unknown. */
+   *  row) the thread is unavailable and the answer stays unknown; with the thread
+   *  in hand a parent that does not resolve is absent — an imported reply the
+   *  lineage left at the root — and there is no turn to replay, which `regenerate`
+   *  can only log about once the button is pressed. */
   const parentIsUserMessage = useMemo(() => {
-    if (message.isCreatedByUser === true || message.parentMessageId == null) {
+    if (message.isCreatedByUser === true) {
       return undefined;
     }
-    const parent = findMessageById(getMessages(), message.parentMessageId);
-    return parent == null ? undefined : parent.isCreatedByUser === true;
+    const messages = getMessages();
+    if (messages == null) {
+      return undefined;
+    }
+    return findMessageById(messages, message.parentMessageId)?.isCreatedByUser === true;
   }, [getMessages, message.isCreatedByUser, message.parentMessageId]);
 
   /** Resolved only if the row has nothing to replay, because the artifact check
    *  inside parses markdown. */
   const getHasEditablePart = useCallback(() => hasEditablePart(message), [message]);
 
+  /** A pending queued follow-up is a generation about to start: no rerun or
+   *  continuation may race it, exactly as while a run is submitting. */
   const generationCapabilities = useGenerationsByLatest({
     isEditing,
-    isSubmitting,
+    isSubmitting: isSubmitting || pendingReveal != null,
     error: message.error,
     endpoint: endpoint ?? '',
     messageId: message.messageId,
@@ -271,7 +288,7 @@ const HoverButtons = ({
           messageId={message.messageId}
           conversationId={conversation.conversationId}
           forkingSupported={forkingSupported}
-          latestMessageId={latestMessageId}
+          getLatestMessageId={getLatestMessageId ?? (() => latestMessageId)}
           isLast={isLast}
         />
       )}

@@ -5,6 +5,9 @@ const {
   reportLocatorTraversalFailure,
   isEnabled,
   normalizeLimit,
+  normalizeSortDirection,
+  normalizeSortField,
+  CONVERSATION_SORT_FIELDS,
   openCheckpointDeletion,
   waitForGenerationPersistence,
   createArchiveAllHandler,
@@ -13,6 +16,10 @@ const {
   isValidSubagentControlRequest,
   exemptAgentTriggerFromIpLimiter,
   createParentSubagentIndexHandler,
+  createBackgroundTaskIndexHandler,
+  createBackgroundTaskCancelHandler,
+  createBackgroundTaskPolicyMiddleware,
+  backgroundTaskRegistry,
   createSubagentThreadViewHandler,
   resolveImportMaxFileSize,
   restoreTenantContextFromReq,
@@ -29,6 +36,7 @@ const {
   isStopConfirmed,
 } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
+const { getAppConfig } = require('~/server/services/Config/app');
 const { CacheKeys, EModelEndpoint } = require('librechat-data-provider');
 const {
   createImportLimiters,
@@ -44,6 +52,9 @@ const { storage, importFileFilter } = require('~/server/routes/files/multer');
 const requireJwtAuth = require('~/server/middleware/requireJwtAuth');
 const { importConversations } = require('~/server/utils/import');
 const subagentThreadTaskStore = require('~/server/services/Endpoints/agents/subagentThreadStore');
+const {
+  pendingBackgroundToolCompletions,
+} = require('~/server/services/Endpoints/agents/backgroundCompletion');
 const getLogStores = require('~/cache/getLogStores');
 const db = require('~/models');
 
@@ -141,6 +152,14 @@ const subagentControlHandler = createSubagentControlHandler({
   getSubagentTaskControlReceipt: db.getSubagentTaskControlReceipt,
   store: subagentThreadTaskStore,
 });
+const backgroundTaskPolicy = createBackgroundTaskPolicyMiddleware({ getAppConfig });
+const backgroundTaskIndexHandler = createBackgroundTaskIndexHandler({
+  registry: backgroundTaskRegistry,
+  pending: pendingBackgroundToolCompletions,
+});
+const backgroundTaskCancelHandler = createBackgroundTaskCancelHandler({
+  registry: backgroundTaskRegistry,
+});
 router.use(requireJwtAuth);
 
 const isValidProjectFilter = (projectId) =>
@@ -153,8 +172,11 @@ router.get('/', async (req, res) => {
   const pinned = isEnabled(req.query.pinned);
   const search =
     typeof req.query.search === 'string' ? req.query.search.trim() || undefined : undefined;
-  const sortBy = req.query.sortBy || 'updatedAt';
-  const sortDirection = req.query.sortDirection || 'desc';
+  const sortBy = normalizeSortField(req.query.sortBy, {
+    fields: CONVERSATION_SORT_FIELDS,
+    fallback: 'updatedAt',
+  });
+  const sortDirection = normalizeSortDirection(req.query.sortDirection);
   const projectId = Array.isArray(req.query.projectId)
     ? req.query.projectId[0]
     : req.query.projectId;
@@ -201,6 +223,12 @@ router.post(
   subagentControlHandler,
 );
 router.get('/:parentConversationId/subagents', parentSubagentIndexHandler);
+router.get('/:conversationId/background-tasks', backgroundTaskPolicy, backgroundTaskIndexHandler);
+router.post(
+  '/:conversationId/background-tasks/cancel',
+  backgroundTaskPolicy,
+  backgroundTaskCancelHandler,
+);
 router.get('/:parentConversationId/subagents/:threadId', subagentThreadViewHandler);
 
 router.get('/:conversationId', async (req, res) => {

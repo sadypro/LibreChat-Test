@@ -1,5 +1,6 @@
 import { memo, useState } from 'react';
-import { BadgeCheck, Check, Globe, Info, Settings, Star, User } from 'lucide-react';
+import { VerifiedIcon } from '@librechat/client';
+import { Check, Globe, Info, Settings, Star, User } from 'lucide-react';
 import type { TranslationKeys } from '~/hooks/useLocalize';
 import type { AgentItem } from './items/types';
 import { hasConfigurableSettings } from './items/configurable';
@@ -104,9 +105,13 @@ function ToolCardImpl({
   const DetailIcon = canConfigure ? Settings : Info;
 
   return (
+    /* touch:h-36 with touch:pb-9 on the content: where a coarse pointer exists the
+     action cluster below is permanent rather than revealed on hover, so the card
+     owes it a strip of its own. Without that the last line of a three-line
+     description sits under the buttons for as long as the card is on screen. */
     <div
       className={cn(
-        'group relative flex h-32 w-full flex-col overflow-hidden rounded-2xl border',
+        'group relative flex h-32 w-full flex-col overflow-hidden rounded-2xl border touch:h-36',
         selected
           ? 'border-status-success bg-status-success/10 shadow-sm'
           : 'border-border-light bg-transparent hover:border-border-medium hover:bg-surface-tertiary hover:shadow-sm',
@@ -117,7 +122,7 @@ function ToolCardImpl({
         onClick={() => onToggle(item)}
         aria-pressed={selected}
         className={cn(
-          'flex h-full w-full cursor-pointer flex-col gap-2 rounded-2xl p-4 text-left',
+          'flex h-full w-full cursor-pointer flex-col gap-2 rounded-2xl p-4 text-left touch:pb-9',
           'focus:outline-none focus-visible:ring-2 focus-visible:ring-ring-primary',
         )}
       >
@@ -128,9 +133,8 @@ function ToolCardImpl({
               <p className="flex min-w-0 flex-1 items-center gap-1 text-sm font-semibold text-text-primary">
                 <span className="truncate">{name}</span>
                 {isNative && (
-                  <BadgeCheck
-                    className="size-4 shrink-0 fill-status-success-strong text-text-on-status"
-                    strokeWidth={2}
+                  <VerifiedIcon
+                    className="size-3.5 shrink-0 text-status-verified"
                     aria-label={localize('com_ui_tools_native')}
                   />
                 )}
@@ -204,8 +208,8 @@ function ToolCardImpl({
               }
               className={cn(
                 'flex size-7 items-center justify-center rounded-lg text-text-secondary',
-                'opacity-0 transition duration-150 hover:bg-surface-hover hover:text-text-primary',
-                'group-focus-within:opacity-100 group-hover:opacity-100',
+                'transition duration-150 hover:bg-surface-hover hover:text-text-primary',
+                'group-focus-within:opacity-100 group-hover:opacity-100 no-touch:opacity-0',
                 'focus:outline-none focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring-primary',
               )}
             >
@@ -223,10 +227,11 @@ function ToolCardImpl({
               aria-label={localize(isFavorited ? 'com_ui_unfavorite' : 'com_ui_favorite')}
               className={cn(
                 'flex size-7 items-center justify-center rounded-lg text-text-secondary',
-                'opacity-0 transition duration-150 hover:bg-surface-hover hover:text-text-primary',
+                'transition duration-150 hover:bg-surface-hover hover:text-text-primary',
                 'group-focus-within:opacity-100 group-hover:opacity-100',
                 'focus:outline-none focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring-primary',
-                isFavorited && 'text-series-4 opacity-100 hover:text-series-4',
+                !isFavorited && 'no-touch:opacity-0',
+                isFavorited && 'text-series-4 hover:text-series-4',
               )}
             >
               <Star className={cn('size-4', isFavorited && 'fill-current')} aria-hidden="true" />

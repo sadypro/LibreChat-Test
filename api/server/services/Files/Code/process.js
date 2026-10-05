@@ -1,5 +1,4 @@
 const path = require('path');
-const { v4 } = require('uuid');
 const { logger } = require('@librechat/data-schemas');
 const { getCodeBaseURL } = require('@librechat/agents');
 const {
@@ -24,6 +23,7 @@ const {
   extractCodeArtifactText,
   extractCodeArtifactRawText,
   extractCodeArtifactInspectionText,
+  prepareCodeOutputBufferForInspection,
   getBoundedCodeOutputByteLimit,
   getExtractedTextFormat,
   getStorageMetadata,
@@ -33,21 +33,19 @@ const {
   executeWorkspaceTool,
   selectCodeFiles,
   getCodeFileInfo,
+  getCodeFileContextLine,
+  appendCodeFileContextLine,
   getUploadedCodeEnvFilename,
   checkCodeFileActive: checkIfActive,
   CODE_OUTPUT_PREFLIGHT_MAX_BYTES,
   CODE_OUTPUT_PREFLIGHT_MAX_COUNT,
   normalizeArtifactDeliveryFailure,
+  processCodeOutput: processCodeOutputWithDeps,
   resolveDownloadPath,
 } = require('@librechat/api');
 const {
-  Tools,
   megabyte,
-  fileConfig,
-  FileContext,
   FileSources,
-  imageExtRegex,
-  inferMimeType,
   EToolResources,
   EModelEndpoint,
   ErrorTypes,
@@ -56,7 +54,7 @@ const {
   getEndpointFileConfig,
 } = require('librechat-data-provider');
 const { filterFilesByAgentAccess } = require('~/server/services/Files/permissions');
-const { createFile, getFiles, updateFile, claimCodeFile } = require('~/models');
+const { getFiles, updateFile, claimCodeFile, commitCodeFile } = require('~/models');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { convertImage } = require('~/server/services/Files/images/convert');
 const { getRetentionExpiry } = require('~/server/services/Files/retention');
@@ -315,66 +313,16 @@ const prepareCodeOutputForInspection = async ({
     executionProfile,
     executionRouteKey,
   });
-  const safeName = sanitizeArtifactPath(name);
-  const fallbackType = inferMimeType(name, '') || 'application/octet-stream';
-  if (!inspectContent) {
-    return {
-      buffer,
-      file: {
-        name,
-        filename: safeName,
-        type: fallbackType,
-      },
-    };
-  }
-  if (buffer.length > fileSizeLimit) {
-    return {
-      buffer,
-      extractedTextComplete: false,
-      file: {
-        name,
-        filename: safeName,
-        type: fallbackType,
-      },
-    };
-  }
-
-  const detectedType = await determineFileType(buffer, true);
-  const detectedMimeType = detectedType?.mime?.toLowerCase();
-  if (detectedMimeType?.startsWith('image/')) {
-    return {
-      buffer,
-      extractedTextComplete: false,
-      file: {
-        name,
-        filename: safeName,
-        type: detectedMimeType,
-      },
-    };
-  }
-
-  const leafName = path.basename(safeName);
-  const unknownText = detectedType == null ? extractCodeArtifactRawText(buffer, 'utf8-text') : null;
-  const mimeType = unknownText != null ? 'text/plain' : (detectedMimeType ?? fallbackType);
-  const category = unknownText != null ? 'utf8-text' : classifyCodeArtifact(leafName, mimeType);
-  const content = unknownText ?? extractCodeArtifactRawText(buffer, category);
-  const extractedText = await extractCodeArtifactInspectionText(
+  return prepareCodeOutputBufferForInspection({
     buffer,
-    leafName,
-    mimeType,
-    category,
-  );
-  return {
-    buffer,
-    extractedTextComplete: extractedText.complete,
-    file: {
-      name,
-      filename: safeName,
-      type: mimeType,
-      content: content ?? undefined,
-      extractedText: extractedText.text ?? undefined,
-    },
-  };
+    name,
+    fileSizeLimit,
+    inspectContent,
+    determineFileType,
+    classify: classifyCodeArtifact,
+    extractRawText: extractCodeArtifactRawText,
+    extractInspectionText: extractCodeArtifactInspectionText,
+  });
 };
 
 /**
@@ -636,490 +584,28 @@ const runPreviewFinalize = ({ finalize, fileId, previewRevision, onResolved }) =
     });
 };
 
-/**
- * Process code execution output files — downloads and saves both images
- * and non-image files. All files are saved to local storage with
- * `codeEnvRef` metadata for code env re-upload.
- *
- * Returns a two-part shape so callers can ship the attachment to the
- * client immediately and run preview extraction in the background:
- *   - `file`: persisted metadata (file is on disk, downloadable, and
- *     has `status: 'pending'` if a preview is still being rendered).
- *   - `finalize` (optional): a thunk returning the deferred preview
- *     result promise. Present only when an inline HTML preview is
- *     expected (office buckets — DOCX/XLSX/XLS/ODS/CSV/PPTX). Caller
- *     decides whether to await or fire-and-forget.
- *
- * Existing fallback paths (size limit, missing storage strategy, error
- * catch) return `{ file }` with no `finalize` — there's nothing to
- * extract.
- *
- * @param {ServerRequest} params.req - The Express request object.
- * @param {string} params.id - The file ID from the code environment.
- * @param {string} params.name - The filename.
- * @param {string} params.toolCallId - The tool call ID that generated the file.
- * @param {string} params.session_id - The code execution session ID.
- * @param {string} params.conversationId - The current conversation ID.
- * @param {string} params.messageId - The current message ID.
- * @param {string} [params.codeApiBaseUrl] - Trusted per-agent Code API endpoint.
- * @param {'default'|'stateful'} [params.executionProfile] - Trusted execution profile.
- * @param {string} [params.executionRouteKey] - Trusted deployment-local route identity.
- * @param {string} [params.bridgeWorkerId] - Trusted bridge worker selected for this execution.
- * @param {Buffer} [params.preparedBuffer] - Bytes downloaded during a
- *   no-write content inspection preflight.
- * @param {boolean} [params.downloadFallback] - Return the bounded download
- *   fallback without downloading the generated bytes again.
- * @returns {Promise<{ file: MongoFile & { messageId: string, toolCallId: string }, finalize?: () => Promise<MongoFile | null> }>}
- */
-const processCodeOutput = async ({
-  req,
-  id,
-  name,
-  toolCallId,
-  conversationId,
-  messageId,
-  session_id,
-  agentId,
-  freshClaimAfter,
-  codeApiBaseUrl,
-  executionProfile = 'default',
-  executionRouteKey = executionProfile,
-  bridgeWorkerId,
-  preparedBuffer,
-  downloadFallback,
-}) => {
-  const appConfig = req.config;
-  const currentDate = new Date();
-  const fileExt = path.extname(name).toLowerCase();
-  const isImage = fileExt && imageExtRegex.test(name);
-
-  const { endpointFileConfig, fileSizeLimit } = getCodeOutputFileSettings(req);
-
-  try {
-    const formattedDate = currentDate.toISOString();
-    if (downloadFallback === true) {
-      return {
-        file: createDownloadFallback({
-          id,
-          name,
-          agentId,
-          messageId,
-          toolCallId,
-          session_id,
-          conversationId,
-          executionProfile,
-          executionRouteKey,
-          expiresAt: currentDate.getTime() + 86400000,
-        }),
-      };
-    }
-    const retentionExpiryPromise = getRetentionExpiry(req);
-    const buffer =
-      preparedBuffer ??
-      (await downloadCodeOutputBuffer({
-        req,
-        id,
-        session_id,
-        maxBytes: fileSizeLimit,
-        codeApiBaseUrl,
-        executionProfile,
-        bridgeWorkerId,
-      }));
-
-    // Enforce file size limit
-    if (buffer.length > fileSizeLimit) {
-      logger.warn(
-        `[processCodeOutput] File "${name}" (${(buffer.length / megabyte).toFixed(2)} MB) exceeds size limit of ${(fileSizeLimit / megabyte).toFixed(2)} MB, falling back to download URL`,
-      );
-      return {
-        file: createDownloadFallback({
-          id,
-          name,
-          agentId,
-          messageId,
-          toolCallId,
-          session_id,
-          conversationId,
-          executionProfile,
-          executionRouteKey,
-          expiresAt: currentDate.getTime() + 86400000,
-        }),
-      };
-    }
-
-    /* Code-output files belong to the user who ran the execution.
-     * SessionKey on codeapi will be `<tenant>:user:<userId>` for these,
-     * so cache and access stay user-private. */
-    const codeEnvRef = {
-      kind: 'user',
-      id: req.user.id,
-      storage_session_id: session_id,
-      file_id: id,
-      executionProfile,
-      ...(executionRouteKey !== executionProfile ? { executionRouteKey } : {}),
-    };
-
-    /* `safeName` keeps the directory structure (`a/b/file.txt` -> `a/b/file.txt`)
-     * so the next prime() can place the file at the same nested path in the
-     * sandbox; flattening would re-create the bug where every nested artifact
-     * collapsed into the root and read_file calls 404'd. The flat-form
-     * storage key is composed below once `file_id` is known so we can cap
-     * the total length at filesystem NAME_MAX. */
-    const safeName = sanitizeArtifactPath(name);
-    if (safeName !== name) {
-      logger.warn(
-        `[processCodeOutput] Filename sanitized: "${name}" -> "${safeName}" | conv=${conversationId}`,
-      );
-    }
-
-    /**
-     * Atomically claim a file_id for this (filename, conversationId, context) tuple.
-     * Uses $setOnInsert so concurrent calls for the same filename converge on
-     * a single record instead of creating duplicates (TOCTOU race fix).
-     *
-     * Claim by `safeName` (not raw `name`) so the claim and the eventual
-     * `createFile` agree on the filename column — otherwise weird inputs
-     * (e.g. `"proj name/file@v1.txt"`) would claim under the raw name and
-     * then write under the sanitized one, leaving the claim row orphaned.
-     */
-    /**
-     * Dispatch-order stamp persisted with every write AND every claim insert
-     * (foreground writes dispatch ≈ now): the out-of-order guard below
-     * compares WRITER dispatch order, not wall-clock write time — an older
-     * task writing late must not make a newer task's harvest look stale, and
-     * a freshly claimed row must carry its claimant's stamp before the
-     * content write lands.
-     */
-    const sourceDispatchedAt = freshClaimAfter ?? Date.now();
-
-    const newFileId = v4();
-    const claimed = await claimCodeFile({
-      filename: safeName,
-      conversationId,
-      file_id: newFileId,
-      user: req.user.id,
-      tenantId: req.user.tenantId,
-      sourceDispatchedAt,
-    });
-    const file_id = claimed.file_id;
-    const isUpdate = file_id !== newFileId;
-
-    /**
-     * Out-of-order guard for detached (background) harvests: when the claimed
-     * row's last writer was dispatched AFTER this task (`freshClaimAfter` =
-     * this task's dispatch time), a newer run owns this filename slot. The
-     * `(filename, conversationId)` unique index means the stale bytes have
-     * nowhere else to live, so skip this file rather than overwrite fresh
-     * content — the harvest's stdout patch still lands, only the superseded
-     * attachment is omitted. Falls back to `updatedAt` for rows written
-     * before the stamp existed (the claim itself is timestamp-neutral).
-     */
-    const lastWriterDispatchedAt =
-      claimed.metadata?.sourceDispatchedAt ??
-      (claimed.updatedAt != null ? new Date(claimed.updatedAt).getTime() : null);
-    if (isUpdate && freshClaimAfter != null && lastWriterDispatchedAt > freshClaimAfter) {
-      logger.warn(
-        `[processCodeOutput] Skipping stale background output "${safeName}" (${file_id}): a newer run owns this filename`,
-      );
-      return null;
-    }
-
-    if (isUpdate) {
-      logger.debug(
-        `[processCodeOutput] Updating existing file "${safeName}" (${file_id}) instead of creating duplicate`,
-      );
-    }
-
-    /**
-     * Background harvests commit through a CONDITIONAL write: the ownership
-     * predicate (last writer's dispatch stamp not newer than ours) is part of
-     * the update's filter, so check and write are one atomic operation — a
-     * stale harvest's commit simply misses and its attachment is skipped.
-     * The row always exists here (the claim inserted it), so the non-upsert
-     * `updateFile` matches `createFile(data, true)` semantics ($set + TTL
-     * unset). Bytes a loser may have already uploaded to the shared storage
-     * key are a narrow residual that per-file locking would be needed to
-     * close. Foreground writes keep the unconditional `createFile` path.
-     */
-    const commitCodeFile = async (fileData) => {
-      if (freshClaimAfter == null) {
-        await createFile(fileData, true);
-        return true;
-      }
-      const committed = await updateFile(fileData, {
-        $or: [
-          { 'metadata.sourceDispatchedAt': { $exists: false } },
-          { 'metadata.sourceDispatchedAt': { $lte: sourceDispatchedAt } },
-        ],
-      });
-      if (!committed) {
-        logger.warn(
-          `[processCodeOutput] Skipping stale background output "${safeName}" (${file_id}): a newer run owns this filename`,
-        );
-        return false;
-      }
-      return true;
-    };
-
-    /**
-     * Preserve the original `messageId` on update. Each `processCodeOutput`
-     * call would otherwise overwrite it with the current run's run id, which
-     * decouples the file from the assistant message that originally created
-     * it. `getCodeGeneratedFiles` filters by `messageId IN <thread>`, so a
-     * stale id (e.g. from a later regeneration / failed re-read attempt)
-     * silently excludes the file from priming on subsequent turns.
-     */
-    const persistedMessageId = isUpdate ? (claimed.messageId ?? messageId) : messageId;
-    /* A generated-output write replaces the file's bytes, so pointers to
-     * earlier content in another profile must not survive as reusable refs. */
-    const codeEnvReferenceSet = mergeCodeEnvRef(undefined, codeEnvRef);
-    const codeEnvMetadata = {
-      ...claimed.metadata,
-      ...codeEnvReferenceSet,
-      sourceDispatchedAt,
-    };
-
-    if (isImage) {
-      const usage = isUpdate ? (claimed.usage ?? 0) + 1 : 1;
-      const _file = await convertImage(req, buffer, 'high', `${file_id}${fileExt}`);
-      const filepath = usage > 1 ? `${_file.filepath}?v=${Date.now()}` : _file.filepath;
-      const storageMetadata = getStorageMetadata({
-        filepath: _file.filepath,
-        source: appConfig.fileStrategy,
-        storageKey: _file.storageKey,
-        storageRegion: _file.storageRegion,
-      });
-      const file = {
-        ..._file,
-        filepath,
-        ...storageMetadata,
-        file_id,
-        messageId: persistedMessageId,
-        usage,
-        filename: safeName,
-        conversationId,
-        executionProfile,
-        user: req.user.id,
-        tenantId: req.user.tenantId,
-        type: `image/${appConfig.imageOutputType}`,
-        createdAt: isUpdate ? claimed.createdAt : formattedDate,
-        updatedAt: formattedDate,
-        source: appConfig.fileStrategy,
-        context: FileContext.execute_code,
-        metadata: codeEnvMetadata,
-        ...(await retentionExpiryPromise),
-      };
-      if (!(await commitCodeFile(file))) {
-        return null;
-      }
-      return { file: Object.assign(file, { messageId, toolCallId, agentId }) };
-    }
-
-    const { saveBuffer } = getStrategyFunctions(appConfig.fileStrategy);
-    if (!saveBuffer) {
-      logger.warn(
-        `[processCodeOutput] saveBuffer not available for strategy ${appConfig.fileStrategy}, falling back to download URL`,
-      );
-      return {
-        file: createDownloadFallback({
-          id,
-          name,
-          agentId,
-          messageId,
-          toolCallId,
-          session_id,
-          conversationId,
-          executionProfile,
-          executionRouteKey,
-          expiresAt: currentDate.getTime() + 86400000,
-        }),
-      };
-    }
-
-    const detectedType = await determineFileType(buffer, true);
-    const mimeType = detectedType?.mime || inferMimeType(name, '') || 'application/octet-stream';
-
-    /** Check MIME type support - for code-generated files, we're lenient but log unsupported types */
-    const isSupportedMimeType = fileConfig.checkType(
-      mimeType,
-      endpointFileConfig.supportedMimeTypes,
-    );
-    if (!isSupportedMimeType) {
-      logger.warn(
-        `[processCodeOutput] File "${name}" has unsupported MIME type "${mimeType}", proceeding with storage but may not be usable as tool resource`,
-      );
-    }
-
-    /* Compose the storage key here, after `file_id` is known, so the
-     * `flattenArtifactPath` cap budget can be calculated against the
-     * actual prefix length. The full key has to fit in one filesystem
-     * path component (NAME_MAX = 255 on most filesystems); without this
-     * cap, deeply-nested artifact paths whose individual segments were
-     * within bounds can still produce a flat form that overflows once
-     * `${file_id}__` is prepended, causing `ENAMETOOLONG` inside
-     * saveBuffer and falling back to a download URL. The 255 figure is
-     * the conservative cross-platform NAME_MAX (Linux ext4, NTFS, APFS).
-     */
-    const NAME_MAX = 255;
-    const flatName = flattenArtifactPath(safeName, NAME_MAX - file_id.length - 2);
-    const fileName = `${file_id}__${flatName}`;
-    const filepath = await saveBuffer({
-      userId: req.user.id,
-      buffer,
-      fileName,
-      basePath: 'uploads',
-      tenantId: req.user.tenantId,
-    });
-    const storageMetadata = getStorageMetadata({
-      filepath,
-      source: appConfig.fileStrategy,
-    });
-
-    /* `classifyCodeArtifact` and `extractCodeArtifactText` make
-     * extension/bare-name decisions on the input string. With the
-     * path-preserving sanitizer they can now receive a nested path like
-     * `reports.v1/Makefile`, which the classifier's `extensionOf` reads
-     * as `v1/Makefile` (the slice after the dot in the directory name)
-     * and the bare-name branch rejects because it sees a `.` anywhere in
-     * the string. Result: extensionless artifacts under dotted folders
-     * (Makefile, Dockerfile, etc.) get misclassified as `other` and
-     * skip text extraction. Pass the basename so classification matches
-     * what it would have gotten with the old flat-name flow. */
-    const leafName = path.basename(safeName);
-    const category = classifyCodeArtifact(leafName, mimeType);
-
-    /* Office-bucket files (DOCX/XLSX/XLS/ODS/CSV/PPTX) route through
-     * `bufferToOfficeHtml` which is CPU-heavy. Persist the record now
-     * with `status: 'pending'` and `text: null` so the agent's response
-     * isn't blocked, then return a `finalize` thunk the caller can run
-     * in the background. Non-office files have cheap or no extraction
-     * — run it inline so the caller gets a fully-resolved record
-     * without juggling a finalize step. */
-    const expectsPreview = hasOfficeHtmlPath(leafName, mimeType);
-
-    const baseFile = {
-      file_id,
-      filepath,
-      ...storageMetadata,
-      messageId: persistedMessageId,
-      object: 'file',
-      filename: safeName,
-      type: mimeType,
-      conversationId,
-      user: req.user.id,
-      tenantId: req.user.tenantId,
-      bytes: buffer.length,
-      updatedAt: formattedDate,
-      metadata: codeEnvMetadata,
-      source: appConfig.fileStrategy,
-      context: FileContext.execute_code,
-      usage: isUpdate ? (claimed.usage ?? 0) + 1 : 1,
-      createdAt: isUpdate ? claimed.createdAt : formattedDate,
-      ...(await retentionExpiryPromise),
-    };
-
-    if (expectsPreview) {
-      /* Persist with `status: 'pending'` and explicit
-       * `text: null` / `textFormat: null` so an update that previously
-       * had cached text gets cleared. The deferred finalize transitions
-       * to 'ready' (with text/textFormat) or 'failed' (with
-       * previewError).
-       *
-       * `previewRevision` is a fresh UUID stamped on every emit. The
-       * deferred finalize's `updateFile` is conditional on this — if
-       * a newer turn (cross-turn filename reuse) has rotated the
-       * revision before this render finishes, the stale render is
-       * silently discarded rather than overwriting the newer record.
-       * (Codex P1 review on PR #12957.) */
-      const previewRevision = v4();
-      const file = {
-        ...baseFile,
-        text: null,
-        textFormat: null,
-        status: 'pending',
-        previewError: null,
-        previewRevision,
-      };
-      if (!(await commitCodeFile(file))) {
-        return null;
-      }
-      return {
-        file: Object.assign(file, { messageId, toolCallId, agentId }),
-        finalize: () =>
-          finalizePreview({ buffer, leafName, mimeType, category, file_id, previewRevision }),
-        previewRevision,
-      };
-    }
-
-    /* Non-office path: extraction is cheap (utf8 decode, parseDocument
-     * for PDF/ODT, or null for binaries). Run inline and return a
-     * fully-resolved record — no `finalize` needed. */
-    const text = await extractCodeArtifactText(buffer, leafName, mimeType, category);
-    /* `textFormat` accompanies `text` so the client can gate
-     * office-HTML-bucket routing on a trusted signal — clients MUST
-     * NOT inject `text` into the iframe as HTML unless `textFormat ===
-     * 'html'`. RAG-uploaded `.docx` etc. arrive with plain text from
-     * mammoth.extractRawText and would otherwise be hijacked by the
-     * extension-based office routing into the HTML-injection path
-     * (Codex P1 review on PR #12934). null on extract failure — the
-     * client treats absence as 'text' for safety. */
-    const textFormat = getExtractedTextFormat(leafName, mimeType, text);
-    const file = {
-      ...baseFile,
-      // Always set explicitly so an update which produces a binary or
-      // oversized artifact clears any previously cached text — createFile
-      // uses findOneAndUpdate with $set semantics.
-      text: text ?? null,
-      textFormat: textFormat ?? null,
-      // Clear deferred-preview lifecycle fields in case the prior emit
-      // at this (filename, conversationId) was an office file —
-      // otherwise stale `pending`/`failed` would persist and the client
-      // would render the wrong state for the now non-office artifact.
-      status: null,
-      previewError: null,
-      previewRevision: null,
-    };
-
-    if (!(await commitCodeFile(file))) {
-      return null;
-    }
-    return { file: Object.assign(file, { messageId, toolCallId, agentId }) };
-  } catch (error) {
-    if (error?.code === 'CODE_OUTPUT_DOWNLOAD_LIMIT') {
-      logger.warn(
-        `[processCodeOutput] Generated file exceeds size limit of ${(fileSizeLimit / megabyte).toFixed(2)} MB, falling back to download URL`,
-      );
-    }
-    if (error?.message === 'Path traversal detected in filename') {
-      logger.warn(
-        `[processCodeOutput] Path traversal blocked for file "${name}" | conv=${conversationId}`,
-      );
-    }
-    logAxiosError({
-      message: 'Error downloading/processing code environment file',
-      error,
-    });
-    logger.warn(
-      `[processCodeOutput] Falling back to Code API download URL for strategy ${appConfig.fileStrategy}`,
-    );
-
-    // Fallback for download errors - return download URL so user can still manually download
-    return {
-      file: createDownloadFallback({
-        id,
-        name,
-        agentId,
-        messageId,
-        toolCallId,
-        session_id,
-        conversationId,
-        executionProfile,
-        executionRouteKey,
-        expiresAt: currentDate.getTime() + 86400000,
-      }),
-    };
-  }
-};
+const processCodeOutput = (params) =>
+  processCodeOutputWithDeps(params, {
+    getCodeOutputFileSettings,
+    downloadCodeOutputBuffer,
+    createDownloadFallback,
+    getRetentionExpiry,
+    convertImage,
+    getStrategyFunctions,
+    determineFileType,
+    claimCodeFile,
+    commitCodeFile,
+    finalizePreview,
+    hasOfficeHtmlPath,
+    sanitizeArtifactPath,
+    flattenArtifactPath,
+    classifyCodeArtifact,
+    extractCodeArtifactText,
+    getExtractedTextFormat,
+    getStorageMetadata,
+    logAxiosError,
+    logger,
+  });
 
 function getSessionFileInfo(ref, req, route = {}, signal) {
   return getCodeFileInfo({
@@ -1136,54 +622,6 @@ function getSessionFileInfo(ref, req, route = {}, signal) {
 async function getSessionInfo(ref, req, route = {}, signal) {
   return (await getSessionFileInfo(ref, req, route, signal))?.lastModified ?? null;
 }
-
-const getPreviewContextSuffix = (file) => {
-  if (file.status === 'pending') {
-    return ' (preview not yet generated)';
-  }
-
-  if (file.status !== 'failed') {
-    return '';
-  }
-
-  return file.previewError
-    ? ` (preview unavailable: ${file.previewError})`
-    : ' (preview unavailable)';
-};
-
-/**
- * A generated output is normally left out — the model already knows what it
- * wrote. That only holds while the file is still where it wrote it: once a
- * newer same-named file takes the bare path, the output mounts under a
- * suffixed name the model has never seen, and silence would leave it reading
- * the newcomer or failing to find its own artifact.
- */
-const getVisibleCodeFileContextLine = (file, agentResourceIds, destination) => {
-  const displaced = destination !== file.filename;
-  if (file.context === FileContext.execute_code && !displaced) {
-    return '';
-  }
-
-  const origin =
-    file.context === FileContext.execute_code
-      ? ` (written earlier as ${file.filename})`
-      : `${agentResourceIds.has(file.file_id) ? '' : ' (attached by user)'}${
-          displaced ? ` (uploaded as ${file.filename})` : ''
-        }`;
-  return `\n\t- /mnt/data/${destination}${origin}${getPreviewContextSuffix(file)}`;
-};
-
-const appendVisibleCodeFileContext = (toolContext, contextLine) => {
-  if (!contextLine) {
-    return toolContext;
-  }
-
-  if (toolContext) {
-    return `${toolContext}${contextLine}`;
-  }
-
-  return `- Note: The following files are available in the "${Tools.execute_code}" tool environment:${contextLine}`;
-};
 
 class CodeResourceRecoveryError extends Error {
   constructor({ required, primed, failed }) {
@@ -1243,6 +681,7 @@ const getReuploadFailureCategory = (error) => {
  * @param {string} [options.agentId] - The agent ID for file access control
  * @param {string} [options.agentResourceType] - Permission resource type for the authorized agent route
  * @param {AbortSignal} [options.signal] - Effective run cancellation signal
+ * @param {import('@librechat/api').CodeFileLocation} [options.codeFileLocation] - Where the model can open primed files
  * @returns {Promise<{
  * files: Array<{ id: string; session_id: string; name: string }>,
  * toolContext: string,
@@ -1258,6 +697,7 @@ const primeFiles = async (options) => {
     executionProfile = 'default',
     executionRouteKey = executionProfile,
     bridgeWorkerId,
+    codeFileLocation,
     signal,
   } = options;
   const codeApiRoute = { baseUrl: codeApiBaseUrl, executionProfile, bridgeWorkerId };
@@ -1341,9 +781,10 @@ const primeFiles = async (options) => {
     const pushFile = (overrideSessionId, overrideId, destination = sandboxName) => {
       /* The sandbox holds the converted name, not the record's, so the mount path has
        * to follow the same rule provisioning uploaded under. */
-      toolContext = appendVisibleCodeFileContext(
+      toolContext = appendCodeFileContextLine(
         toolContext,
-        getVisibleCodeFileContextLine(file, agentResourceIds, destination),
+        getCodeFileContextLine(file, agentResourceIds, destination, codeFileLocation),
+        codeFileLocation,
       );
       /* `id` is the storage file_id (drives codeapi's upload-key
        * existence check), `resource_id` is the entity that owns
@@ -1626,6 +1067,8 @@ async function readSandboxFile({
  * @param {Object} params
  * @param {string} params.file_path
  * @param {string} params.workspace_id
+ * @param {string} [params.workspace_instance_id]
+ * @param {boolean} [params.linked_worktrees]
  * @param {number} params.start_line
  * @param {number} params.max_lines
  * @param {string} params.codeApiBaseUrl
@@ -1637,6 +1080,8 @@ async function readSandboxFile({
 async function readWorkspaceFile({
   file_path,
   workspace_id,
+  workspace_instance_id,
+  linked_worktrees,
   start_line,
   max_lines,
   codeApiBaseUrl,
@@ -1644,18 +1089,27 @@ async function readWorkspaceFile({
   bridgeWorkerId,
   req,
   signal,
+  maxQueueWaitMs,
+  maxRequestTimeoutMs,
+  deadlineAtMs,
 }) {
-  const authHeaders = await getCodeApiAuthHeaders(req, bridgeWorkerId);
   return executeWorkspaceTool({
     baseURL: codeApiBaseUrl,
-    authHeaders: {
-      ...authHeaders,
+    linkedWorktrees: linked_worktrees,
+    maxQueueWaitMs,
+    codeApiMaxRetryWaitMs: req?.config?.endpoints?.agents?.codeApiMaxRetryWaitMs,
+    maxRequestTimeoutMs,
+    deadlineAtMs,
+    /** Minted per admission attempt: a queued call outlives one token TTL. */
+    authHeaders: async () => ({
+      ...(await getCodeApiAuthHeaders(req, bridgeWorkerId)),
       ...codeExecutionHeaders({ executionProfile, bridgeWorkerId }),
-    },
+    }),
     request: {
       protocolVersion: 1,
       operation: 'read_file',
       workspaceId: workspace_id,
+      ...(workspace_instance_id ? { workspaceInstanceId: workspace_instance_id } : {}),
       path: file_path,
       startLine: start_line,
       maxLines: max_lines,
@@ -1670,6 +1124,8 @@ async function readWorkspaceFile({
  * @param {Object} params
  * @param {string} params.query
  * @param {string} params.workspace_id
+ * @param {string} [params.workspace_instance_id]
+ * @param {boolean} [params.linked_worktrees]
  * @param {string} [params.path]
  * @param {number} params.max_results
  * @param {string} params.codeApiBaseUrl
@@ -1681,6 +1137,8 @@ async function readWorkspaceFile({
 async function searchWorkspace({
   query,
   workspace_id,
+  workspace_instance_id,
+  linked_worktrees,
   path,
   max_results,
   codeApiBaseUrl,
@@ -1688,18 +1146,27 @@ async function searchWorkspace({
   bridgeWorkerId,
   req,
   signal,
+  maxQueueWaitMs,
+  maxRequestTimeoutMs,
+  deadlineAtMs,
 }) {
-  const authHeaders = await getCodeApiAuthHeaders(req, bridgeWorkerId);
   return executeWorkspaceTool({
     baseURL: codeApiBaseUrl,
-    authHeaders: {
-      ...authHeaders,
+    linkedWorktrees: linked_worktrees,
+    maxQueueWaitMs,
+    codeApiMaxRetryWaitMs: req?.config?.endpoints?.agents?.codeApiMaxRetryWaitMs,
+    maxRequestTimeoutMs,
+    deadlineAtMs,
+    /** Minted per admission attempt: a queued call outlives one token TTL. */
+    authHeaders: async () => ({
+      ...(await getCodeApiAuthHeaders(req, bridgeWorkerId)),
       ...codeExecutionHeaders({ executionProfile, bridgeWorkerId }),
-    },
+    }),
     request: {
       protocolVersion: 1,
       operation: 'search_text',
       workspaceId: workspace_id,
+      ...(workspace_instance_id ? { workspaceInstanceId: workspace_instance_id } : {}),
       query,
       ...(path ? { path } : {}),
       maxResults: max_results,
@@ -1713,6 +1180,8 @@ async function searchWorkspace({
  *
  * @param {Object} params
  * @param {string} params.workspace_id
+ * @param {string} [params.workspace_instance_id]
+ * @param {boolean} [params.linked_worktrees]
  * @param {string} [params.path]
  * @param {string} [params.after_path]
  * @param {number} params.max_results
@@ -1724,6 +1193,8 @@ async function searchWorkspace({
  */
 async function listWorkspaceFiles({
   workspace_id,
+  workspace_instance_id,
+  linked_worktrees,
   path,
   after_path,
   max_results,
@@ -1732,18 +1203,27 @@ async function listWorkspaceFiles({
   bridgeWorkerId,
   req,
   signal,
+  maxQueueWaitMs,
+  maxRequestTimeoutMs,
+  deadlineAtMs,
 }) {
-  const authHeaders = await getCodeApiAuthHeaders(req, bridgeWorkerId);
   return executeWorkspaceTool({
     baseURL: codeApiBaseUrl,
-    authHeaders: {
-      ...authHeaders,
+    linkedWorktrees: linked_worktrees,
+    maxQueueWaitMs,
+    codeApiMaxRetryWaitMs: req?.config?.endpoints?.agents?.codeApiMaxRetryWaitMs,
+    maxRequestTimeoutMs,
+    deadlineAtMs,
+    /** Minted per admission attempt: a queued call outlives one token TTL. */
+    authHeaders: async () => ({
+      ...(await getCodeApiAuthHeaders(req, bridgeWorkerId)),
       ...codeExecutionHeaders({ executionProfile, bridgeWorkerId }),
-    },
+    }),
     request: {
       protocolVersion: 1,
       operation: 'list_files',
       workspaceId: workspace_id,
+      ...(workspace_instance_id ? { workspaceInstanceId: workspace_instance_id } : {}),
       ...(path ? { path } : {}),
       ...(after_path ? { afterPath: after_path } : {}),
       maxResults: max_results,
@@ -1758,23 +1238,34 @@ async function writeWorkspaceFile({
   content,
   overwrite,
   workspace_id,
+  workspace_instance_id,
+  linked_worktrees,
   codeApiBaseUrl,
   executionProfile,
   bridgeWorkerId,
   req,
   signal,
+  maxQueueWaitMs,
+  maxRequestTimeoutMs,
+  deadlineAtMs,
 }) {
-  const authHeaders = await getCodeApiAuthHeaders(req, bridgeWorkerId);
   return executeWorkspaceTool({
     baseURL: codeApiBaseUrl,
-    authHeaders: {
-      ...authHeaders,
+    linkedWorktrees: linked_worktrees,
+    maxQueueWaitMs,
+    codeApiMaxRetryWaitMs: req?.config?.endpoints?.agents?.codeApiMaxRetryWaitMs,
+    maxRequestTimeoutMs,
+    deadlineAtMs,
+    /** Minted per admission attempt: a queued call outlives one token TTL. */
+    authHeaders: async () => ({
+      ...(await getCodeApiAuthHeaders(req, bridgeWorkerId)),
       ...codeExecutionHeaders({ executionProfile, bridgeWorkerId }),
-    },
+    }),
     request: {
       protocolVersion: 1,
       operation: 'write_file',
       workspaceId: workspace_id,
+      ...(workspace_instance_id ? { workspaceInstanceId: workspace_instance_id } : {}),
       path: file_path,
       content,
       overwrite,
@@ -1788,27 +1279,40 @@ async function editWorkspaceFile({
   file_path,
   edits,
   expected_base_sha256,
+  matching,
   workspace_id,
+  workspace_instance_id,
+  linked_worktrees,
   codeApiBaseUrl,
   executionProfile,
   bridgeWorkerId,
   req,
   signal,
+  maxQueueWaitMs,
+  maxRequestTimeoutMs,
+  deadlineAtMs,
 }) {
-  const authHeaders = await getCodeApiAuthHeaders(req, bridgeWorkerId);
   return executeWorkspaceTool({
     baseURL: codeApiBaseUrl,
-    authHeaders: {
-      ...authHeaders,
+    linkedWorktrees: linked_worktrees,
+    maxQueueWaitMs,
+    codeApiMaxRetryWaitMs: req?.config?.endpoints?.agents?.codeApiMaxRetryWaitMs,
+    maxRequestTimeoutMs,
+    deadlineAtMs,
+    /** Minted per admission attempt: a queued call outlives one token TTL. */
+    authHeaders: async () => ({
+      ...(await getCodeApiAuthHeaders(req, bridgeWorkerId)),
       ...codeExecutionHeaders({ executionProfile, bridgeWorkerId }),
-    },
+    }),
     request: {
       protocolVersion: 1,
       operation: 'edit_file',
       workspaceId: workspace_id,
+      ...(workspace_instance_id ? { workspaceInstanceId: workspace_instance_id } : {}),
       path: file_path,
       edits,
       ...(expected_base_sha256 ? { expectedBaseSha256: expected_base_sha256 } : {}),
+      matching,
     },
     ...(signal ? { signal } : {}),
   });
@@ -1818,26 +1322,39 @@ async function editWorkspaceFile({
 async function previewWorkspaceEdit({
   file_path,
   edits,
+  matching,
   workspace_id,
+  workspace_instance_id,
+  linked_worktrees,
   codeApiBaseUrl,
   executionProfile,
   bridgeWorkerId,
   req,
   signal,
+  maxQueueWaitMs,
+  maxRequestTimeoutMs,
+  deadlineAtMs,
 }) {
-  const authHeaders = await getCodeApiAuthHeaders(req, bridgeWorkerId);
   return executeWorkspaceTool({
     baseURL: codeApiBaseUrl,
-    authHeaders: {
-      ...authHeaders,
+    linkedWorktrees: linked_worktrees,
+    maxQueueWaitMs,
+    codeApiMaxRetryWaitMs: req?.config?.endpoints?.agents?.codeApiMaxRetryWaitMs,
+    maxRequestTimeoutMs,
+    deadlineAtMs,
+    /** Minted per admission attempt: a queued call outlives one token TTL. */
+    authHeaders: async () => ({
+      ...(await getCodeApiAuthHeaders(req, bridgeWorkerId)),
       ...codeExecutionHeaders({ executionProfile, bridgeWorkerId }),
-    },
+    }),
     request: {
       protocolVersion: 1,
       operation: 'preview_edit',
       workspaceId: workspace_id,
+      ...(workspace_instance_id ? { workspaceInstanceId: workspace_instance_id } : {}),
       path: file_path,
       edits,
+      matching,
     },
     ...(signal ? { signal } : {}),
   });

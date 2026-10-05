@@ -55,6 +55,8 @@ export const codeEnvironmentById = (id: string) =>
   `${codeEnvironments()}/${encodeURIComponent(id)}`;
 export const codeEnvironmentSettings = (id: string) => `${codeEnvironmentById(id)}/settings`;
 export const codeEnvironmentStatus = (id: string) => `${codeEnvironmentById(id)}/status`;
+export const codeEnvironmentConversationDecision = (conversationId: string) =>
+  `${codeEnvironments()}/conversations/${encodeURIComponent(conversationId)}/decision`;
 
 const messagesRoot = `${BASE_URL}/api/messages`;
 
@@ -138,6 +140,12 @@ export const subagentThread = (
 
 export const subagentControl = (parentConversationId: string, threadId: string) =>
   `${conversationsRoot}/${encodeURIComponent(parentConversationId)}/subagents/${encodeURIComponent(threadId)}/control`;
+
+export const backgroundTasks = (conversationId: string) =>
+  `${conversationsRoot}/${encodeURIComponent(conversationId)}/background-tasks`;
+
+export const backgroundTasksCancel = (conversationId: string) =>
+  `${backgroundTasks(conversationId)}/cancel`;
 
 export const genTitle = (conversationId: string) =>
   `${conversationsRoot}/gen_title/${encodeURIComponent(conversationId)}`;
@@ -320,7 +328,8 @@ export const agents = ({ path = '', options }: { path?: string; options?: object
 export const activeJobs = () => `${BASE_URL}/api/agents/chat/active`;
 
 const agentQueuedTurnsRoot = `${BASE_URL}/api/agents/chat/queued-turns`;
-export const agentQueuedTurns = () => agentQueuedTurnsRoot;
+export const agentQueuedTurns = (protocolVersion?: 2) =>
+  protocolVersion === 2 ? `${agentQueuedTurnsRoot}/v2` : agentQueuedTurnsRoot;
 export const agentQueuedTurnsByConversation = (
   conversationId: string,
   clientRequestIds: string[] = [],
@@ -466,6 +475,25 @@ export const skillFile = (id: string, relativePath: string) =>
 
 export const insights = () => `${BASE_URL}/api/insights`;
 export const insightsAccess = () => `${insights()}/access`;
+
+/* Conversation traces */
+export const conversationTrace = (conversationId: string) =>
+  `${BASE_URL}/api/traces/${encodeURIComponent(conversationId)}`;
+export const conversationTraceAvailability = (conversationId: string) =>
+  `${conversationTrace(conversationId)}/availability`;
+export const conversationTraceRecords = (conversationId: string, cursor?: string) =>
+  `${conversationTrace(conversationId)}/records${
+    cursor ? `?${new URLSearchParams({ cursor }).toString()}` : ''
+  }`;
+export const conversationTraceRecord = (
+  conversationId: string,
+  recordId: string,
+  messageId: string,
+  sourceId?: string,
+) =>
+  `${conversationTrace(conversationId)}/records/${encodeURIComponent(recordId)}?${new URLSearchParams(
+    { message: messageId, ...(sourceId ? { source: sourceId } : {}) },
+  ).toString()}`;
 
 export const adminSkillsSync = () => `${BASE_URL}/api/admin/skills/sync`;
 export const adminSkillsSyncStatus = () => `${adminSkillsSync()}/status`;

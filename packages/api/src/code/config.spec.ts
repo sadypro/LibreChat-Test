@@ -1,6 +1,94 @@
 import { EModelEndpoint } from 'librechat-data-provider';
 import type { AppConfig } from '@librechat/data-schemas';
-import { mergeAccessibleCodeEnvironments } from './config';
+import {
+  isImplicitStatefulCodeRouteAvailable,
+  mergeAccessibleCodeEnvironments,
+  resolveCodeEnvironmentDecisionVersion,
+  resolveCodeEnvironmentMoveVersion,
+  resolveCodeEnvironmentTransitionVersion,
+  resolveCodeEnvironmentMoveCapabilities,
+} from './config';
+
+describe('resolveCodeEnvironmentDecisionVersion', () => {
+  it('advertises the exact supported protocol version', () => {
+    expect(resolveCodeEnvironmentDecisionVersion('1')).toBe(1);
+  });
+
+  it.each([undefined, '0', '2', '1.0', 'true'])(
+    'keeps unsupported configured version %s on the legacy-safe path',
+    (version) => {
+      expect(resolveCodeEnvironmentDecisionVersion(version)).toBeUndefined();
+    },
+  );
+});
+
+describe('resolveCodeEnvironmentMoveVersion', () => {
+  const withMoves = (conversationMoves?: { enabled?: boolean; allowAttachDetach?: boolean }) =>
+    ({
+      endpoints: {
+        [EModelEndpoint.agents]: {
+          statefulCodeSessions: { allowedEnvironments: ['user'], conversationMoves },
+        },
+      },
+    }) as unknown as AppConfig;
+
+  it('advertises moves only where the effective policy enables them', () => {
+    expect(resolveCodeEnvironmentMoveVersion(withMoves({ enabled: true }))).toBe(1);
+    expect(resolveCodeEnvironmentMoveCapabilities(withMoves({ enabled: true }))).toEqual({
+      codeEnvironmentMoveVersion: 1,
+      codeWorkspaceRecoveryVersion: 1,
+    });
+  });
+
+  /* Attaching and leaving ship under the same policy as the move but on their own number, so a
+   * client that predates them keeps reading a move version it understands. */
+  it.each([undefined, false])(
+    'preserves enabled move-only policy with allowAttachDetach=%s',
+    (allowAttachDetach) => {
+      const config = withMoves({ enabled: true, allowAttachDetach });
+      expect(resolveCodeEnvironmentMoveVersion(config)).toBe(1);
+      expect(resolveCodeEnvironmentTransitionVersion(config)).toBeUndefined();
+    },
+  );
+
+  it('advertises attach and detach separately from the move', () => {
+    expect(
+      resolveCodeEnvironmentTransitionVersion(
+        withMoves({ enabled: true, allowAttachDetach: true }),
+      ),
+    ).toBe(2);
+  });
+
+  it.each([undefined, {}, { enabled: false }])(
+    'keeps attach and detach off wherever moves are off: %j',
+    (conversationMoves) => {
+      expect(resolveCodeEnvironmentTransitionVersion(withMoves(conversationMoves))).toBeUndefined();
+    },
+  );
+
+  it.each([undefined, {}, { enabled: false }])(
+    'keeps sealed decisions immovable by default: %j',
+    (conversationMoves) => {
+      expect(resolveCodeEnvironmentMoveVersion(withMoves(conversationMoves))).toBeUndefined();
+      expect(resolveCodeEnvironmentMoveCapabilities(withMoves(conversationMoves))).toEqual({});
+    },
+  );
+
+  it('keeps moves off without any stateful code configuration', () => {
+    expect(resolveCodeEnvironmentMoveVersion({} as AppConfig)).toBeUndefined();
+    expect(resolveCodeEnvironmentMoveVersion(undefined)).toBeUndefined();
+    expect(resolveCodeEnvironmentMoveCapabilities({} as AppConfig)).toEqual({});
+    expect(resolveCodeEnvironmentMoveCapabilities(undefined)).toEqual({});
+  });
+});
+
+describe('isImplicitStatefulCodeRouteAvailable', () => {
+  it('requires both the deployed protocol version and a non-empty managed base URL', () => {
+    expect(isImplicitStatefulCodeRouteAvailable('1', 'https://code.example/v1')).toBe(true);
+    expect(isImplicitStatefulCodeRouteAvailable(undefined, 'https://code.example/v1')).toBe(false);
+    expect(isImplicitStatefulCodeRouteAvailable('1', '  ')).toBe(false);
+  });
+});
 
 describe('mergeAccessibleCodeEnvironments', () => {
   test('adds principal environments without allowing them to shadow deployment entries', async () => {

@@ -18,8 +18,6 @@ const {
   createAgentRunEnvelope,
   createAgentExecutionContext,
   createMCPRuntimeRequestBody,
-  getCodeWorkspaceSelections,
-  collectReachableAgents,
   buildAgentScopedContext,
   buildInlineMemoryContext,
   buildAgentContextAttachmentsByAgentId,
@@ -55,6 +53,7 @@ const {
   isContentFilterError,
   getSafeErrorMetadata,
   getUserFacingProviderError,
+  getAgentErrorMetadata,
   createToolExecuteHandler,
   createOwnedToolEndHandler,
   resolveRecursionLimit,
@@ -78,12 +77,17 @@ const {
   sendResponsesErrorResponse,
   createResponsesEventHandlers,
   createAggregatorEventHandlers,
+  createClientToolHandoff,
   getLangfuseTraceMessageFields,
   stripActivityLabelParts,
+  stripUnusableSummaryParts,
   CHILD_THREAD_READ_ONLY_ERROR,
   executeAgentRun,
   waitForAgentExecutionWrites,
   resolveToolRoleGrants,
+  resolveAdmittedCodeEnvironmentDecision,
+  resolvePersistableCodeEnvironmentDecision,
+  createTerminalRunErrorObserver,
 } = require('@librechat/api');
 const {
   createResponsesToolEndCallback,
@@ -124,7 +128,6 @@ const filterFilesByRemoteAgentAccess = (params) =>
   filterFilesByAgentAccess({ ...params, resourceType: ResourceType.REMOTE_AGENT });
 
 function handleExecutionError({ error, res, appConfig }) {
-  logger.error('[Responses API] Error:', getSafeErrorMetadata(error));
   const protectionEnabled = hasModelBoundContentProtection(
     appConfig?.filters,
     appConfig?.messageFilter?.pii,
@@ -145,12 +148,10 @@ function handleExecutionError({ error, res, appConfig }) {
       error.body.error,
     );
   }
-  const statusCode =
-    typeof error?.status === 'number' && error.status >= 400 && error.status < 600
-      ? error.status
-      : 500;
+  const errorMetadata = getAgentErrorMetadata(error);
+  const statusCode = errorMetadata?.status ?? 500;
   const errorType = statusCode >= 400 && statusCode < 500 ? 'invalid_request' : 'server_error';
-  const errorCode = !protectionEnabled && typeof error?.code === 'string' ? error.code : undefined;
+  const errorCode = !protectionEnabled ? errorMetadata?.code : undefined;
   if (errorCode === undefined) {
     sendResponsesErrorResponse(res, statusCode, errorMessage, errorType);
   } else {
@@ -195,7 +196,7 @@ function createToolLoader({ req, res, signal, definitionsOnly = true }) {
         streamId: null,
       });
     } catch (error) {
-      if (isFatalAgentInitializationError(error) || isContentFilterError(error)) {
+      if (isFatalAgentInitializationError(error, { signal }) || isContentFilterError(error)) {
         throw error;
       }
       logger.error('Error loading tools for agent ' + agentId, getSafeErrorMetadata(error));
@@ -447,9 +448,10 @@ async function saveResponseOutput(
  * @param {string} conversationId
  * @param {string} agentId
  * @param {object} agent
+ * @param {import('@librechat/api').ConversationCodeEnvironmentDecision} codeEnvironmentDecision
  * @returns {Promise<void>}
  */
-async function saveConversation(req, conversationId, agentId, agent, codeWorkspaces) {
+async function saveConversation(req, conversationId, agentId, agent, codeEnvironmentDecision) {
   const title = resolveConversationTitle(req, agent?.name || 'Open Responses Conversation');
   await db.saveConvo(
     {
@@ -462,7 +464,11 @@ async function saveConversation(req, conversationId, agentId, agent, codeWorkspa
       conversationId,
       endpoint: EModelEndpoint.agents,
       agent_id: agentId,
-      ...(codeWorkspaces !== undefined && { codeWorkspaces }),
+      ...resolvePersistableCodeEnvironmentDecision({
+        conversationId,
+        decision: codeEnvironmentDecision,
+        conversation: req.resolvedConversation,
+      }),
       ...(title != null && { title }),
       model: agent?.model,
     },
@@ -622,6 +628,16 @@ const executeResponse = async (envelope, { req, res }) => {
 
   // Generate IDs
   const responseId = generateResponseId();
+  const terminalRunError = createTerminalRunErrorObserver({
+    maxProviderErrorChars: appConfig?.endpoints?.agents?.maxProviderErrorChars,
+    logger,
+    responseMessageId: responseId,
+    source: '[Responses API]',
+    protectionEnabled: hasModelBoundContentProtection(
+      appConfig?.filters,
+      appConfig?.messageFilter?.pii,
+    ),
+  });
   const context = createResponseContext(request, responseId);
 
   logger.debug(
@@ -667,7 +683,10 @@ const executeResponse = async (envelope, { req, res }) => {
     onSettlementError: (error) => {
       logger.error('[Responses API] Failed to settle execution:', getSafeErrorMetadata(error));
     },
-    handleExecutionError: (error) => handleExecutionError({ error, res, appConfig }),
+    handleExecutionError: (error, signal) => {
+      terminalRunError.log(error, signal);
+      return handleExecutionError({ error, res, appConfig });
+    },
     execute: async (execution) => {
       if (request.previous_response_id != null) {
         if (typeof request.previous_response_id !== 'string') {
@@ -697,15 +716,28 @@ const executeResponse = async (envelope, { req, res }) => {
         }
       }
 
+      const { decision: codeEnvironmentDecision, conversation: admittedConversation } =
+        await resolveAdmittedCodeEnvironmentDecision({
+          appConfig,
+          conversation: req.resolvedConversation,
+          conversationId,
+          requestedMode: request.code_environment_mode,
+          requestedSelections: request.code_workspaces,
+          readDecision: (id) => db.readAdmittedConvoCodeEnvironmentDecision(principal.userId, id),
+        });
+      req.resolvedConversation = admittedConversation;
       const parentMessageId = null;
       const mcpRequestBody = createMCPRuntimeRequestBody({
         messageId: responseId,
         conversationId,
-        codeWorkspaces: request.code_workspaces ?? req.resolvedConversation?.codeWorkspaces,
+        codeEnvironmentMode: codeEnvironmentDecision.mode,
+        codeWorkspaces: codeEnvironmentDecision.codeWorkspaces,
       });
       const agentsEConfig = appConfig?.endpoints?.[EModelEndpoint.agents];
       const ordinaryToolCancellationEnabled =
         agentsEConfig?.backgroundTasks?.ordinaryToolCancellation === true;
+      const backgroundCompletionResultMaxChars =
+        agentsEConfig?.backgroundTasks?.completionResultMaxChars;
       const previousMessages = request.previous_response_id
         ? await loadPreviousMessages(request.previous_response_id, principal.userId)
         : [];
@@ -749,6 +781,7 @@ const executeResponse = async (envelope, { req, res }) => {
         listSkillsByAccess: skillDbMethods.listSkillsByAccess,
         listAlwaysApplySkills: skillDbMethods.listAlwaysApplySkills,
         getSkillByName: skillDbMethods.getSkillByName,
+        getRoleByName: db.getRoleByName,
       };
 
       const enabledCapabilities = new Set(agentsEConfig?.capabilities);
@@ -778,6 +811,12 @@ const executeResponse = async (envelope, { req, res }) => {
        *  a tool the loader is about to drop. */
       const fileSearchAvailable =
         fileSearchCapabilityEnabled && (await toolRoleGrants)?.fileSearch === true;
+      /** Called by `initializeAgent` only when an agent's built provider config
+       *  turns native web search on. It reaches the initializer with `runtime`
+       *  and no `req`, so this is what lets it join the grants memoized on this
+       *  request instead of issuing its own read. */
+      const resolveWebSearchGrant = async () =>
+        (await resolveToolRoleGrants({ req, getRoleByName: db.getRoleByName })).webSearch;
       const skillsCapabilityEnabled = enabledCapabilities.has(AgentCapabilities.skills);
       const ephemeralSkillsToggle = request.ephemeralAgent?.skills === true;
       const accessibleSkillIds = skillsCapabilityEnabled
@@ -844,6 +883,7 @@ const executeResponse = async (envelope, { req, res }) => {
           }),
           codeEnvAvailable,
           fileSearchAvailable,
+          resolveWebSearchGrant,
           backgroundToolsAvailable: enabledCapabilities.has(AgentCapabilities.run_in_background),
           toolIntentsAvailable: enabledCapabilities.has(AgentCapabilities.tool_intents),
           statefulSessionsAvailable: enabledCapabilities.has(
@@ -854,6 +894,7 @@ const executeResponse = async (envelope, { req, res }) => {
           skillStates,
           defaultActiveOnShare,
           manualSkills,
+          signal: execution.signal,
         },
         dbMethods,
       );
@@ -890,6 +931,7 @@ const executeResponse = async (envelope, { req, res }) => {
         const discoveryParams = {
           req,
           res,
+          signal: execution.signal,
           primaryConfig,
           endpointOption,
           allowedProviders,
@@ -924,6 +966,7 @@ const executeResponse = async (envelope, { req, res }) => {
           defaultActiveOnShare,
           codeEnvAvailable,
           fileSearchAvailable,
+          resolveWebSearchGrant,
           backgroundToolsAvailable: enabledCapabilities.has(AgentCapabilities.run_in_background),
           toolIntentsAvailable: enabledCapabilities.has(AgentCapabilities.tool_intents),
           statefulSessionsAvailable: enabledCapabilities.has(
@@ -1052,6 +1095,25 @@ const executeResponse = async (envelope, { req, res }) => {
       // Merge previous messages with new input
       const allMessages = [...previousMessages, ...inputMessages];
 
+      /** The caller's function tools: declared to the model with no server-side
+       *  executor, handed back when the model calls one, and reported on the
+       *  response as the subset that was actually applied.
+       *
+       *  Built once every agent of the run is known, because the interception
+       *  matches on tool name across the whole graph: a name a subagent owns
+       *  collides exactly as a primary one does. */
+      const clientTools = createClientToolHandoff({
+        tools: request.tools,
+        agentDefinitions: primaryConfig.toolDefinitions,
+        serverDefinitions: modelBoundAgents.flatMap((runAgent) => runAgent.toolDefinitions ?? []),
+        responseId,
+      });
+      if (clientTools.error != null) {
+        return sendResponsesErrorResponse(res, 400, clientTools.error, 'invalid_request');
+      }
+      primaryConfig.toolDefinitions = clientTools.toolDefinitions;
+      context.tools = clientTools.appliedTools;
+
       const toolSet = buildRunToolSet(
         primaryConfig,
         handoffAgentConfigs.values(),
@@ -1059,7 +1121,11 @@ const executeResponse = async (envelope, { req, res }) => {
         allMessages,
         true,
       );
-      const formatted = formatAgentMessages(stripActivityLabelParts(allMessages), {}, toolSet);
+      const formatted = formatAgentMessages(
+        stripUnusableSummaryParts(stripActivityLabelParts(allMessages)),
+        {},
+        toolSet,
+      );
       const formattedMessages = formatted.messages;
       const initialSummary = formatted.summary;
       let indexTokenCountMap = formatted.indexTokenCountMap;
@@ -1126,6 +1192,9 @@ const executeResponse = async (envelope, { req, res }) => {
           res,
           context,
           tracker,
+          /* The run terminates a caller-executed call's item itself: the server
+             never executes one, so `on_tool_end` cannot. */
+          clientToolNames: clientTools.clientToolNames,
         };
 
         // Emit response.created then response.in_progress per Open Responses spec
@@ -1133,8 +1202,11 @@ const executeResponse = async (envelope, { req, res }) => {
         emitResponseInProgress(handlerConfig);
 
         // Create event handlers
-        const { handlers: responsesHandlers, finalizeStream } =
-          createResponsesEventHandlers(handlerConfig);
+        const {
+          handlers: responsesHandlers,
+          finalizeStream,
+          emitClientToolDeferral,
+        } = createResponsesEventHandlers(handlerConfig);
 
         // Collect usage for balance tracking
         const collectedUsage = [];
@@ -1153,6 +1225,7 @@ const executeResponse = async (envelope, { req, res }) => {
           runSignal: execution.signal,
           foregroundRunId: responseId,
           ordinaryToolCancellation: ordinaryToolCancellationEnabled,
+          backgroundCompletionResultMaxChars,
           provisionFiles: createProvisionFilesCallback({
             req,
             agentToolContexts,
@@ -1201,7 +1274,7 @@ const executeResponse = async (envelope, { req, res }) => {
         const handlers = {
           on_message_delta: responsesHandlers.on_message_delta,
           on_reasoning_delta: responsesHandlers.on_reasoning_delta,
-          on_run_step: responsesHandlers.on_run_step,
+          on_run_step: clientTools.wrapRunStep(responsesHandlers.on_run_step),
           on_run_step_delta: responsesHandlers.on_run_step_delta,
           on_chat_model_end: {
             handle: (event, data, metadata, graph) => {
@@ -1220,7 +1293,12 @@ const executeResponse = async (envelope, { req, res }) => {
           on_chain_end: { handle: () => {} },
           on_agent_update: { handle: () => {} },
           on_custom_event: { handle: () => {} },
-          on_tool_execute: createToolExecuteHandler(toolExecuteOptions),
+          /** The deferral answer is emitted as the call's `function_call_output`,
+           *  so a caller can tell an answered call from one handed back to it. */
+          on_tool_execute: clientTools.wrapToolExecute(
+            createToolExecuteHandler(toolExecuteOptions),
+            emitClientToolDeferral,
+          ),
           on_agent_log: agentLogHandlerObj,
           ...(summarizationConfig?.enabled !== false
             ? buildSummarizationHandlers({ isStreaming: actuallyStreaming, res })
@@ -1246,6 +1324,8 @@ const executeResponse = async (envelope, { req, res }) => {
           user: { ...createSafeUser(req.user), id: userId },
           traceContext: { endpoint: EModelEndpoint.agents },
           tenantId: principal.tenantId,
+          modelCallbacks: [terminalRunError.modelCallback],
+          clientToolNames: clientTools.clientToolNames,
           /** Bills subagent child-run model calls (reported outside the
            *  streamEvents loop) into the same collectedUsage array. */
           subagentUsageSink: createSubagentUsageSink(collectedUsage),
@@ -1328,15 +1408,7 @@ const executeResponse = async (envelope, { req, res }) => {
         if (request.store === true) {
           try {
             // Save conversation
-            await saveConversation(
-              req,
-              conversationId,
-              agentId,
-              agent,
-              getCodeWorkspaceSelections(
-                collectReachableAgents(runAgents).map((config) => config.codeExecutionContext),
-              ),
-            );
+            await saveConversation(req, conversationId, agentId, agent, codeEnvironmentDecision);
 
             // Save input messages
             await saveInputMessages(req, conversationId, inputMessages, agentId);
@@ -1390,6 +1462,7 @@ const executeResponse = async (envelope, { req, res }) => {
           runSignal: execution.signal,
           foregroundRunId: responseId,
           ordinaryToolCancellation: ordinaryToolCancellationEnabled,
+          backgroundCompletionResultMaxChars,
           provisionFiles: createProvisionFilesCallback({
             req,
             agentToolContexts,
@@ -1437,7 +1510,7 @@ const executeResponse = async (envelope, { req, res }) => {
         const handlers = {
           on_message_delta: aggregatorHandlers.on_message_delta,
           on_reasoning_delta: aggregatorHandlers.on_reasoning_delta,
-          on_run_step: aggregatorHandlers.on_run_step,
+          on_run_step: clientTools.wrapRunStep(aggregatorHandlers.on_run_step),
           on_run_step_delta: aggregatorHandlers.on_run_step_delta,
           on_chat_model_end: {
             handle: (event, data, metadata, graph) => {
@@ -1456,7 +1529,10 @@ const executeResponse = async (envelope, { req, res }) => {
           on_chain_end: { handle: () => {} },
           on_agent_update: { handle: () => {} },
           on_custom_event: { handle: () => {} },
-          on_tool_execute: createToolExecuteHandler(toolExecuteOptions),
+          on_tool_execute: clientTools.wrapToolExecute(
+            createToolExecuteHandler(toolExecuteOptions),
+            (callId, output) => aggregator.toolOutputs.set(callId, output),
+          ),
           on_agent_log: agentLogHandlerObj,
           ...(summarizationConfig?.enabled !== false
             ? buildSummarizationHandlers({ isStreaming: false, res })
@@ -1481,6 +1557,8 @@ const executeResponse = async (envelope, { req, res }) => {
           user: { ...createSafeUser(req.user), id: userId },
           traceContext: { endpoint: EModelEndpoint.agents },
           tenantId: principal.tenantId,
+          modelCallbacks: [terminalRunError.modelCallback],
+          clientToolNames: clientTools.clientToolNames,
           /** Bills subagent child-run model calls (reported outside the
            *  streamEvents loop) into the same collectedUsage array. */
           subagentUsageSink: createSubagentUsageSink(collectedUsage),
@@ -1567,15 +1645,7 @@ const executeResponse = async (envelope, { req, res }) => {
 
         if (request.store === true) {
           try {
-            await saveConversation(
-              req,
-              conversationId,
-              agentId,
-              agent,
-              getCodeWorkspaceSelections(
-                collectReachableAgents(runAgents).map((config) => config.codeExecutionContext),
-              ),
-            );
+            await saveConversation(req, conversationId, agentId, agent, codeEnvironmentDecision);
 
             await saveInputMessages(req, conversationId, inputMessages, agentId);
 

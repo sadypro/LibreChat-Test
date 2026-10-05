@@ -1,5 +1,5 @@
 import React, { createRef } from 'react';
-import { render } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { RecoilRoot } from 'recoil';
 import { DndProvider } from 'react-dnd';
@@ -13,6 +13,7 @@ import store from '~/store';
 /* The section resolves a conversation's project from the query cache, so the
  * tree needs a client even though the data hooks themselves are mocked. */
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+let mockActiveJobIds: string[] = [];
 
 jest.mock('react-virtualized', () => {
   const actual = jest.requireActual('react-virtualized');
@@ -62,6 +63,12 @@ jest.mock('~/store', () => {
 jest.mock('~/hooks', () => ({
   useLocalize: () => (key: string) => key,
   useElementSize: () => ({ ref: jest.fn(), width: 300, height: 600 }),
+  useOuterScrollWindow: () => ({
+    ref: jest.fn(),
+    height: 600,
+    scrollTop: 0,
+    isOnScreen: () => true,
+  }),
   TranslationKeys: {},
 }));
 
@@ -74,18 +81,21 @@ jest.mock('@librechat/client', () => ({
 }));
 
 jest.mock('~/data-provider', () => ({
-  useActiveJobs: () => ({ data: undefined }),
+  useActiveJobs: () => ({ data: { activeJobIds: mockActiveJobIds } }),
   useAssignConversationToProjectMutation: () => ({ mutate: jest.fn() }),
+  usePinConversationMutation: () => ({ mutate: jest.fn() }),
 }));
 
 jest.mock('~/utils', () => ({
-  groupConversationsByDate: () => [],
+  groupConversations: jest.fn(jest.requireActual('~/utils/convos').groupConversations),
   cn: (...args: unknown[]) => args.filter(Boolean).join(' '),
 }));
 
 jest.mock('../Convo', () => ({
   __esModule: true,
-  default: () => <div data-testid="convo" />,
+  default: ({ conversation }: { conversation: TConversation }) => (
+    <div data-testid="convo">{conversation.title}</div>
+  ),
 }));
 
 const pinnedConvo = {
@@ -96,6 +106,77 @@ const pinnedConvo = {
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
 } as TConversation;
+
+describe('Conversations: live running order', () => {
+  const containerRef = createRef<List>();
+  const newer = {
+    conversationId: 'newer',
+    title: 'Newer idle chat',
+    createdAt: '2026-09-26T00:00:00.000Z',
+    updatedAt: '2026-09-26T00:00:00.000Z',
+  } as TConversation;
+  const running = {
+    conversationId: 'running',
+    title: 'Older running chat',
+    createdAt: '2026-08-01T00:00:00.000Z',
+    updatedAt: '2026-08-01T00:00:00.000Z',
+  } as TConversation;
+
+  afterEach(() => {
+    mockActiveJobIds = [];
+  });
+
+  it('promotes and restores a chat without changing its paged input', () => {
+    const conversations = [newer, running];
+    const renderList = () => (
+      <QueryClientProvider client={queryClient}>
+        <DndProvider backend={HTML5Backend}>
+          <RecoilRoot>
+            <Conversations
+              conversations={conversations}
+              moveToTop={jest.fn()}
+              toggleNav={jest.fn()}
+              containerRef={containerRef}
+              loadMoreConversations={jest.fn()}
+              isLoading={false}
+              isSearchLoading={false}
+              isChatsExpanded={true}
+              setIsChatsExpanded={jest.fn()}
+              scrollViewport={null}
+              scrollContent={null}
+            />
+          </RecoilRoot>
+        </DndProvider>
+      </QueryClientProvider>
+    );
+    const rowOrder = () => screen.getAllByTestId('convo').map((row) => row.textContent);
+
+    const view = render(renderList());
+    const groupConversationsMock = jest.requireMock('~/utils').groupConversations as jest.Mock;
+    groupConversationsMock.mockClear();
+    expect(rowOrder()).toEqual(['Newer idle chat', 'Older running chat']);
+    expect(screen.queryByRole('heading', { name: 'com_a11y_chats_running_section' })).toBeNull();
+
+    mockActiveJobIds = ['running'];
+    view.rerender(renderList());
+    expect(
+      screen.getByRole('heading', { name: 'com_a11y_chats_running_section' }),
+    ).toBeInTheDocument();
+    expect(rowOrder()).toEqual(['Older running chat', 'Newer idle chat']);
+    expect(groupConversationsMock).not.toHaveBeenCalled();
+
+    mockActiveJobIds = ['running'];
+    view.rerender(renderList());
+    expect(groupConversationsMock).not.toHaveBeenCalled();
+    expect(rowOrder()).toEqual(['Older running chat', 'Newer idle chat']);
+
+    mockActiveJobIds = [];
+    view.rerender(renderList());
+    expect(screen.queryByRole('heading', { name: 'com_a11y_chats_running_section' })).toBeNull();
+    expect(rowOrder()).toEqual(['Newer idle chat', 'Older running chat']);
+    expect(conversations).toEqual([newer, running]);
+  });
+});
 
 describe('Conversations: pinned chats live in PinnedSection', () => {
   const containerRef = createRef<List>();
@@ -125,6 +206,8 @@ describe('Conversations: pinned chats live in PinnedSection', () => {
               isSearchLoading={false}
               isChatsExpanded={true}
               setIsChatsExpanded={jest.fn()}
+              scrollViewport={null}
+              scrollContent={null}
             />
           </RecoilRoot>
         </DndProvider>
@@ -132,8 +215,42 @@ describe('Conversations: pinned chats live in PinnedSection', () => {
     );
 
   it('does not render a pinned header inside the chats list', () => {
-    const { queryByText } = renderConversations([pinnedConvo]);
+    const { queryByText, queryByTestId } = renderConversations([pinnedConvo]);
     expect(queryByText('com_ui_pinned')).not.toBeInTheDocument();
+    expect(queryByTestId('convo')).not.toBeInTheDocument();
+  });
+
+  it('shows pinned search matches in Chats while the Pinned section is hidden', () => {
+    renderConversations([pinnedConvo, pinnedConvo], 'Pinned Chat');
+
+    expect(screen.getAllByTestId('convo')).toHaveLength(1);
+    expect(screen.getByTestId('convo')).toHaveTextContent('Pinned Chat');
+    expect(screen.queryByText('com_ui_no_search_results')).not.toBeInTheDocument();
+  });
+
+  it('keeps running matches promoted when search includes pinned chats', () => {
+    mockActiveJobIds = ['running'];
+    const running = {
+      ...pinnedConvo,
+      conversationId: 'running',
+      title: 'Running match',
+      pinned: false,
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    } as TConversation;
+
+    try {
+      renderConversations([pinnedConvo, running], 'match');
+
+      expect(screen.getAllByTestId('convo').map((row) => row.textContent)).toEqual([
+        'Running match',
+        'Pinned Chat',
+      ]);
+      expect(
+        screen.getByRole('heading', { name: 'com_a11y_chats_running_section' }),
+      ).toBeInTheDocument();
+    } finally {
+      mockActiveJobIds = [];
+    }
   });
 
   it('does not render a duplicate new chat button in the chats header', () => {
@@ -150,11 +267,17 @@ describe('Conversations: all-pin pages still paginate', () => {
     loadMoreConversations,
     isChatsExpanded = true,
     isLoading = false,
+    isError = false,
+    onRetry,
+    hasNextPage = false,
   }: {
     conversations: TConversation[];
     loadMoreConversations: () => void;
     isChatsExpanded?: boolean;
     isLoading?: boolean;
+    isError?: boolean;
+    onRetry?: () => void;
+    hasNextPage?: boolean;
   }) =>
     render(
       <QueryClientProvider client={queryClient}>
@@ -168,18 +291,47 @@ describe('Conversations: all-pin pages still paginate', () => {
               loadMoreConversations={loadMoreConversations}
               isLoading={isLoading}
               isSearchLoading={false}
+              isError={isError}
+              onRetry={onRetry}
               isChatsExpanded={isChatsExpanded}
               setIsChatsExpanded={jest.fn()}
+              hasNextPage={hasNextPage}
+              scrollViewport={null}
+              scrollContent={null}
             />
           </RecoilRoot>
         </DndProvider>
       </QueryClientProvider>,
     );
+  it('renders a retryable load error instead of the empty state', () => {
+    const onRetry = jest.fn();
+    renderList({
+      conversations: [],
+      loadMoreConversations: jest.fn(),
+      isError: true,
+      onRetry,
+    });
+
+    expect(screen.getByTestId('convo-list-error')).toHaveTextContent('com_ui_chats_load_error');
+    expect(screen.queryByTestId('convo-list-empty')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'com_ui_retry' }));
+    expect(onRetry).toHaveBeenCalledTimes(1);
+  });
 
   it('requests another page when grouping leaves the chats list empty', () => {
     const loadMoreConversations = jest.fn();
     renderList({ conversations: [pinnedConvo], loadMoreConversations });
     expect(loadMoreConversations).toHaveBeenCalled();
+  });
+
+  it('does not show no chats when a drained unfiltered page contains only pinned rows', () => {
+    renderList({
+      conversations: [pinnedConvo],
+      loadMoreConversations: jest.fn(),
+      hasNextPage: false,
+    });
+
+    expect(screen.queryByText('com_ui_no_chats')).not.toBeInTheDocument();
   });
 
   it('does not request another page while chats are collapsed', () => {
@@ -222,6 +374,8 @@ describe('Conversations: all-pin pages still paginate', () => {
               isSearchLoading={false}
               isChatsExpanded={true}
               setIsChatsExpanded={jest.fn()}
+              scrollViewport={null}
+              scrollContent={null}
             />
           </RecoilRoot>
         </DndProvider>
@@ -241,6 +395,8 @@ describe('Conversations: all-pin pages still paginate', () => {
               isSearchLoading={false}
               isChatsExpanded={true}
               setIsChatsExpanded={jest.fn()}
+              scrollViewport={null}
+              scrollContent={null}
             />
           </RecoilRoot>
         </DndProvider>

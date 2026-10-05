@@ -8,6 +8,17 @@ import type { SetterOrUpdater } from 'recoil';
 import type { ExtendedFile, FileSetter, ConvoGenerator } from '~/common';
 import type { QueuedMessageContext } from '~/hooks/Chat/useSteering';
 import {
+  cn,
+  getModelSpec,
+  hasIncompleteFiles,
+  removeFocusRings,
+  getComposerDraftId,
+  getPendingDraftId,
+  clearAllDrafts,
+  getFilesDraftCached,
+  isPastedTextFileMarked,
+} from '~/utils';
+import {
   useTextarea,
   useAutoSave,
   useLocalize,
@@ -18,15 +29,6 @@ import {
   useFocusChatEffect,
   useCodeWorkspace,
 } from '~/hooks';
-import {
-  cn,
-  getModelSpec,
-  hasIncompleteFiles,
-  removeFocusRings,
-  getComposerDraftId,
-  getFilesDraftCached,
-  isPastedTextFileMarked,
-} from '~/utils';
 import {
   useChatContext,
   useChatFormContext,
@@ -57,6 +59,7 @@ import FileFormChat from './Files/FileFormChat';
 import InFlightSteers from './InFlightSteers';
 import TextareaHeader from './TextareaHeader';
 import PromptsCommand from './PromptsCommand';
+import { submitFromComposer } from './submit';
 import SkillsCommand from './SkillsCommand';
 import AudioRecorder from './AudioRecorder';
 import AutoPlayAudio from './AutoPlayAudio';
@@ -69,6 +72,26 @@ import EditBadges from './EditBadges';
 import BadgeRow from './BadgeRow';
 import Mention from './Mention';
 import store from '~/store';
+
+export function toRestoredComposerFile(
+  file: NonNullable<TMessage['files']>[number],
+): ExtendedFile | null {
+  if (!file.file_id) {
+    return null;
+  }
+  return {
+    file_id: file.file_id,
+    filename: file.filename,
+    filepath: file.filepath,
+    type: file.type ?? '',
+    height: file.height,
+    width: file.width,
+    size: file.bytes ?? 0,
+    progress: 1,
+    attached: true,
+    llmDeliveryPath: file.llmDeliveryPath,
+  };
+}
 
 interface ChatFormProps {
   index: number;
@@ -180,6 +203,7 @@ const ChatForm = memo(function ChatForm({
     () => conversation?.conversationId ?? Constants.NEW_CONVO,
     [conversation?.conversationId],
   );
+  const isNewConversation = conversationId === '' || conversationId === Constants.NEW_CONVO;
   /**
    * The quote feature merges excerpts server-side in `BaseClient.sendMessage`,
    * which the Assistants endpoints bypass — so hide the UI there rather than
@@ -259,7 +283,7 @@ const ChatForm = memo(function ChatForm({
    *  collapsed batch is neither — it hands the composer back to the thread. */
   const composerReserved = answerMode.composerAnswers || answerMode.composerLocked;
 
-  useAutoSave({
+  const consumeDraft = useAutoSave({
     index,
     files,
     setFiles,
@@ -346,20 +370,11 @@ const ChatForm = memo(function ChatForm({
         setFiles((prev) => {
           const next = new Map(prev);
           for (const file of chipFiles) {
-            if (!file.file_id) {
+            const restoredFile = toRestoredComposerFile(file);
+            if (restoredFile == null) {
               continue;
             }
-            next.set(file.file_id, {
-              file_id: file.file_id,
-              filename: file.filename,
-              filepath: file.filepath,
-              type: file.type ?? '',
-              height: file.height,
-              width: file.width,
-              size: file.bytes ?? 0,
-              progress: 1,
-              attached: true,
-            });
+            next.set(restoredFile.file_id, restoredFile);
           }
           return next;
         });
@@ -370,6 +385,8 @@ const ChatForm = memo(function ChatForm({
     [methods, setFiles, restoreComposerContext],
   );
   const steering = useSteering({
+    consumeDraft,
+    addedConversation: addedConvo,
     index,
     conversationId,
     conversation,
@@ -563,6 +580,7 @@ const ChatForm = memo(function ChatForm({
           ref={submitButtonRef}
           control={methods.control}
           steering={steering}
+          isNewConversation={isNewConversation}
           getText={() => methods.getValues('text')}
           onConsumed={consumeComposer}
           disabled={filesLoading}
@@ -602,25 +620,33 @@ const ChatForm = memo(function ChatForm({
     bottomClearance = 'sm:mb-10';
   }
 
+  /** Answer mode, then during-run steering or queueing (a run in flight, or a
+   *  queued follow-up about to start), then an ordinary send: the same route
+   *  for typed, dictated, and shortcut-bound submissions. */
+  const submitComposerText = useCallback(
+    (data: { text: string }): false | void =>
+      submitFromComposer(
+        {
+          answerMode,
+          steering,
+          submitMessage: (message) => {
+            const result = submitMessage(message);
+            if (result !== false) {
+              clearAllDrafts(getPendingDraftId(index));
+            }
+            return result;
+          },
+          reset: () => methods.reset(),
+        },
+        data,
+      ),
+    [answerMode, steering, submitMessage, methods, index],
+  );
+
   return (
     <form
       onSubmit={methods.handleSubmit((data) => {
-        // Answer mode: composer text answers the paused run instead of
-        // starting a new turn (submitText resets the composer itself).
-        // Dismissing the popover — or collapsing a batch, which answers in its
-        // own card — restores normal sends.
-        if (answerMode.active && answerMode.submitText(data.text)) {
-          return;
-        }
-        // During a run, a submit steers or queues per the effective action
-        // instead of starting a new turn (which would be dropped anyway).
-        if (steering.duringRunActive) {
-          if (steering.submitDuringRun(data.text)) {
-            methods.reset();
-          }
-          return;
-        }
-        return submitMessage(data);
+        submitComposerText(data);
       })}
       className={cn(
         /* `margin-bottom` is animated as well as `max-width`: it is what carries
@@ -649,6 +675,27 @@ const ChatForm = memo(function ChatForm({
               conversationId={conversationId}
               onRestoreToComposer={restoreReclaimedSteer}
             />
+          )}
+          {(project || codeWorkspace.visible) && (
+            <div
+              data-testid="composer-context-rail"
+              className={cn(
+                'mx-4 -mb-3 flex min-w-0 flex-wrap items-center gap-1 rounded-t-2xl',
+                'border border-border-light bg-surface-secondary px-2 pb-4 pt-1',
+                isRTL && 'flex-row-reverse',
+              )}
+            >
+              {project ? <ProjectLandingChip project={project} /> : null}
+              {codeWorkspace.visible ? (
+                <div className="min-w-0 px-1 pt-1">
+                  <CodeWorkspaceMenu
+                    setConversation={setConversation}
+                    workspace={codeWorkspace}
+                    disabled={disableInputs || isSubmitting}
+                  />
+                </div>
+              ) : null}
+            </div>
           )}
           <div className={cn('flex w-full items-center', isRTL && 'flex-row-reverse')}>
             <Mention
@@ -703,7 +750,6 @@ const ChatForm = memo(function ChatForm({
                 isTemporary && 'border-series-6/50 bg-series-6/10 high-contrast:border-series-6',
               )}
             >
-              {project ? <ProjectLandingChip project={project} /> : null}
               <TextareaHeader addedConvo={addedConvo} setAddedConvo={setAddedConvo} />
               <PendingManualSkillsChips conversationId={conversationId} />
               {quotesEnabled && (
@@ -782,11 +828,6 @@ const ChatForm = memo(function ChatForm({
                       onFocus={handleTextareaFocus}
                       onBlur={handleTextareaBlur}
                       aria-label={localize('com_ui_message_input')}
-                      aria-describedby={
-                        codeWorkspace.state === 'choose' || codeWorkspace.state === 'missing'
-                          ? `code-workspace-hint-${index}`
-                          : undefined
-                      }
                       onClick={handleFocusOrClick}
                       style={{ height: 44, overflowY: 'auto' }}
                       className={cn(
@@ -804,15 +845,6 @@ const ChatForm = memo(function ChatForm({
                     />
                   </div>
                 </div>
-              )}
-              {(codeWorkspace.state === 'choose' || codeWorkspace.state === 'missing') && (
-                <p
-                  id={`code-workspace-hint-${index}`}
-                  role="status"
-                  className="px-5 pb-2 text-sm text-text-secondary"
-                >
-                  {localize('com_error_code_workspace_required')}
-                </p>
               )}
               <div
                 className={cn(
@@ -848,13 +880,7 @@ const ChatForm = memo(function ChatForm({
                   conversation={conversation}
                   addedConversation={addedConvo}
                   setConversation={setConversation}
-                  disabled={disableInputs || isSubmitting}
-                />
-                <CodeWorkspaceMenu
-                  conversation={conversation}
-                  setConversation={setConversation}
-                  workspace={codeWorkspace}
-                  disabled={disableInputs || isSubmitting}
+                  disabled={disableInputs}
                 />
                 {index === 0 && conversationId != null && (
                   <PendingToolApprovalButton conversationId={conversationId} />
@@ -864,7 +890,7 @@ const ChatForm = memo(function ChatForm({
                 {SpeechToText && (
                   <AudioRecorder
                     methods={methods}
-                    ask={submitMessage}
+                    ask={submitComposerText}
                     disabled={disableInputs || isNotAppendable}
                     isSubmitting={isSubmitting}
                   />
@@ -875,6 +901,7 @@ const ChatForm = memo(function ChatForm({
                     <div className="shrink-0">
                       <InterruptSteerButton
                         steering={steering}
+                        isNewConversation={isNewConversation}
                         getText={() => methods.getValues('text')}
                         onConsumed={consumeComposer}
                         disabled={filesLoading}
@@ -964,6 +991,7 @@ function ChatFormWrapper({
       conversation?.model,
       conversation?.maxContextTokens,
       conversation?.codeApprovalMode,
+      conversation?.codeEnvironmentMode,
       conversation?.codeWorkspaces,
       hasMessages,
     ],

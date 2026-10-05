@@ -90,6 +90,21 @@ module.exports = {
       }
       return Math.min(Math.max(limit, 1), max);
     }),
+    /** Mirrors the real whitelist and helpers so the route's sort normalization is exercised. */
+    CONVERSATION_SORT_FIELDS: {
+      title: true,
+      createdAt: true,
+      updatedAt: true,
+      archivedAt: true,
+    },
+    normalizeSortField: jest.fn((value, { fields, fallback }) => {
+      const raw = Array.isArray(value) ? value[0] : value;
+      return typeof raw === 'string' && fields[raw] === true ? raw : fallback;
+    }),
+    normalizeSortDirection: jest.fn((value, { fallback = 'desc' } = {}) => {
+      const raw = Array.isArray(value) ? value[0] : value;
+      return raw === 'asc' || raw === 'desc' ? raw : fallback;
+    }),
     resolveImportMaxFileSize: jest.fn(() => 262144000),
     createAxiosInstance: jest.fn(() => ({
       get: jest.fn(),
@@ -108,6 +123,13 @@ module.exports = {
     }),
     createSubagentThreadViewHandler: jest.fn(() => (_req, res) => res.status(200).json({})),
     createSubagentControlHandler: jest.fn(() => (_req, res) => res.status(200).json({})),
+    createBackgroundTaskIndexHandler: jest.fn(
+      () => (_req, res) => res.status(200).json({ tasks: [] }),
+    ),
+    createBackgroundTaskPolicyMiddleware: jest.fn(() => (_req, _res, next) => next()),
+    createBackgroundTaskCancelHandler: jest.fn(
+      () => (_req, res) => res.status(200).json({ results: [] }),
+    ),
     isValidSubagentControlRequest: jest.fn((body) => {
       if (body == null || typeof body !== 'object') return false;
       const commonKeys = ['taskId', 'invocationId', 'action'];

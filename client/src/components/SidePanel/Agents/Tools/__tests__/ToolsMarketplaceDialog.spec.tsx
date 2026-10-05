@@ -1,5 +1,6 @@
 import '@testing-library/jest-dom/extend-expect';
 import { fireEvent, render, screen } from '@testing-library/react';
+import type { SVGProps } from 'react';
 import ToolsMarketplaceDialog from '../ToolsMarketplaceDialog';
 
 const mockSetValue = jest.fn();
@@ -7,6 +8,7 @@ const mockGetValues = jest.fn((_: string): unknown => []);
 let mockWatchedTools: string[] = [];
 let mockExecuteCode = false;
 let mockMcpServersMap = new Map<string, object>();
+let mockIsDesktop = true;
 
 jest.mock('react-hook-form', () => ({
   useFormContext: () => ({
@@ -96,7 +98,7 @@ jest.mock('../hooks', () => {
         mcpServersMap: mcpServersMap ?? new Map(),
         skills: [],
         actions: agentActions,
-        permissions: { mcp: true, skills: false },
+        permissions: { mcp: true, skills: false, webSearch: true, runCode: true, fileSearch: true },
       });
       const selected = deriveSelectedItems(
         {
@@ -145,6 +147,8 @@ jest.mock('@librechat/client', () => {
       asChild
         ? React.createElement(React.Fragment, null, children)
         : React.createElement('button', { type: 'button' }, children),
+    VerifiedIcon: (props: SVGProps<SVGSVGElement>) => React.createElement('svg', props),
+    useMediaQuery: () => mockIsDesktop,
     useToastContext: () => ({ showToast: jest.fn() }),
   };
 });
@@ -168,6 +172,7 @@ describe('ToolsMarketplaceDialog', () => {
     mockMcpServersMap = new Map();
     mockToggleFavorite.mockClear();
     mockFavoriteKeys = new Set<string>();
+    mockIsDesktop = true;
     mockFileEntries = { contextFiles: [], knowledgeFiles: [], codeFiles: [] };
   });
 
@@ -392,6 +397,15 @@ describe('ToolsMarketplaceDialog', () => {
 
   test('the Favorites view is empty without favorites', () => {
     render(<ToolsMarketplaceDialog open onOpenChange={jest.fn()} agentId="a1" />);
+    fireEvent.click(screen.getByRole('button', { name: /com_ui_tools_view_favorites/ }));
+    expect(screen.getByText('com_ui_tools_view_favorites_empty')).toBeInTheDocument();
+  });
+
+  test('below md the rail is replaced by a functional filter chip row', () => {
+    mockIsDesktop = false;
+    render(<ToolsMarketplaceDialog open onOpenChange={jest.fn()} agentId="a1" />);
+    expect(screen.getByRole('group', { name: 'com_ui_tools_marketplace' })).toBeInTheDocument();
+    expect(screen.queryByText('com_ui_tools_create_new')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /com_ui_tools_view_favorites/ }));
     expect(screen.getByText('com_ui_tools_view_favorites_empty')).toBeInTheDocument();
   });

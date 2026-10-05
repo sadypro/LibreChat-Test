@@ -33,6 +33,7 @@ import {
   shouldFailMCPOAuthFallback,
   isTerminalMCPOAuthPollingError,
   shouldUseMCPConnectionStatus,
+  applyPendingOAuthState,
   applyMCPDiscoveryAuthorizationState,
 } from './polling';
 import {
@@ -45,6 +46,7 @@ import {
 import { useGetStartupConfig, useMCPServersQuery, useMCPToolsQuery } from '~/data-provider';
 import { mcpServerInitStatesAtom, getServerInitState } from '~/store/mcp';
 import { getMCPReinitializeErrorMessage } from './errors';
+import { openInNewTab } from '~/utils';
 
 export interface MCPServerDefinition {
   serverName: string;
@@ -213,7 +215,10 @@ export function useMCPServerManager({
   });
   const connectionStatus = useMemo(() => {
     if (!polledConnectionStatus) {
-      return applyMCPDiscoveryAuthorizationState(polledConnectionStatus, discoveredMCPTools);
+      return applyPendingOAuthState(
+        applyMCPDiscoveryAuthorizationState(polledConnectionStatus, discoveredMCPTools),
+        serverInitStates,
+      );
     }
 
     let changed = false;
@@ -227,8 +232,11 @@ export function useMCPServerManager({
       nextStatus[serverName] = { ...status, requestScoped: true };
     }
     const normalizedStatus = changed ? nextStatus : polledConnectionStatus;
-    return applyMCPDiscoveryAuthorizationState(normalizedStatus, discoveredMCPTools);
-  }, [polledConnectionStatus, loadedServers, discoveredMCPTools]);
+    return applyPendingOAuthState(
+      applyMCPDiscoveryAuthorizationState(normalizedStatus, discoveredMCPTools),
+      serverInitStates,
+    );
+  }, [polledConnectionStatus, loadedServers, discoveredMCPTools, serverInitStates]);
 
   const updateServerInitState = useCallback(
     (serverName: string, updates: Partial<MCPServerInitState>) => {
@@ -514,7 +522,7 @@ export function useMCPServerManager({
           });
 
           if (autoOpenOAuth) {
-            window.open(response.oauthUrl, '_blank', 'noopener,noreferrer');
+            openInNewTab(response.oauthUrl);
           }
 
           startServerPolling(serverName, response.flowId, response.oauthTimeout);

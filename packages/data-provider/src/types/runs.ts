@@ -38,6 +38,10 @@ export enum StepEvents {
   ON_MESSAGE_DELTA = 'on_message_delta',
   ON_REASONING_DELTA = 'on_reasoning_delta',
   ON_RUN_STEP_DELTA = 'on_run_step_delta',
+  /** SDK handoff from generated arguments to host or direct tool execution. */
+  ON_TOOL_CALLS_DISPATCHED = 'on_tool_calls_dispatched',
+  /** Compact first-fragment marker, retained for resumable generations. */
+  ON_TOOL_PREPARATION = 'on_tool_preparation',
   ON_RUN_STEP_COMPLETED = 'on_run_step_completed',
   /** Terminal signal for a run step: closed with a status and timestamps. */
   ON_RUN_STEP_CLOSED = 'on_run_step_closed',
@@ -295,6 +299,15 @@ export type TContextUsageEvent = {
   /** Completed output in a resumable job. Separate from the saved-message field
    * so older clients do not add it alongside their trailing-text estimate. */
   resumedOutputTokens?: number;
+  /** Tool-result tokens retained AFTER this pre-invoke snapshot, counted with the
+   *  run's own tokenizer. A run that stops at the tool-call limit keeps the result
+   *  its final call's tools produced, and no later snapshot describes it: the
+   *  snapshot precedes the call, and the limit means no further call is made. The
+   *  client adds this the way it adds `completedOutputTokens`, so the gauge and the
+   *  tool-call share include the retained result instead of missing it until the
+   *  next turn's snapshot carries it as kept-message context. Counted, never
+   *  estimated — the per-tool `toolMessageTokenCounts` stay a subset of the share. */
+  retainedToolTokens?: number;
 };
 
 /**
@@ -530,6 +543,8 @@ export type SubagentUpdatePhase =
   | 'start'
   | 'run_step'
   | 'run_step_delta'
+  | 'tool_preparation'
+  | 'tool_calls_dispatched'
   | 'run_step_completed'
   | 'run_step_closed'
   | 'message_delta'

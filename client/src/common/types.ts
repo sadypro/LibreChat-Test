@@ -399,8 +399,11 @@ export type TMessageChatContext = {
   index: number;
   regenerate: (message: t.TMessage, options?: { addedConvo?: t.TConversation | null }) => void;
   conversation: t.TConversation | null;
-  latestMessageId: string | undefined;
-  latestMessageDepth: number | undefined;
+  /** Getter backed by a ref, for reads at call time. Rendering reads the row's
+   *  `latestMessageId` prop, which its comparator gates on the row's relation. */
+  readonly latestMessageId: string | undefined;
+  /** Getter backed by a ref, for reads at call time (see `latestMessageId`). */
+  readonly latestMessageDepth: number | undefined;
   handleContinue: (e: React.MouseEvent<HTMLButtonElement>) => void;
   /** Resolved once per chat from `interface.feedback`; false until the config loads */
   feedbackEnabled: boolean;
@@ -491,7 +494,7 @@ export type ToolDialogProps = {
 };
 
 export type TResError = {
-  response: { data: { message: string } };
+  response: { data: { message: string; code?: string } };
   message: string;
 };
 
@@ -596,6 +599,7 @@ export interface ExtendedFile {
   source?: FileSources;
   attached?: boolean;
   embedded?: boolean;
+  llmDeliveryPath?: t.TFile['llmDeliveryPath'];
   tool_resource?: string;
   metadata?: t.TFile['metadata'];
 }
@@ -676,8 +680,13 @@ export type TThread = { id: string; createdAt: string };
 declare global {
   interface Window {
     google_tag_manager?: unknown;
+    /** Answers the server emits with the document, ahead of the app's own
+     *  scripts, for questions the first render must not guess at. */
     __LIBRECHAT_CONFIG__?: {
       enableQueryDevtools?: boolean;
+      /** Whether this deployment configured footer content of its own, so the
+       *  composer reserves the footer bar's band on its first frame. */
+      hasConfiguredFooter?: boolean;
     };
   }
 }
